@@ -1,0 +1,21 @@
+[tasks]
+bmc
+
+[options]
+bmc:
+mode bmc
+depth 20
+
+[engines]
+bmc:
+smtbmc bitwuzla
+
+[script]
+read -formal sram_smoke.v
+read -formal sram_bb.v hamming_sram_2kb.v
+prep -top sram_smoke
+
+[files]
+sram_smoke.v
+../src/sram_bb.v
+../src/hamming_sram_2kb.v

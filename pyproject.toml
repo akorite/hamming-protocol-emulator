@@ -1,0 +1,17 @@
+[project]
+name = "protocol-emulator-asic"
+version = "0.1.0"
+description = "General-purpose programmable protocol emulator ASIC for the Jane Street x Tiny Tapeout competition"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "cocotb==2.0.1",
+    "pytest==8.4.2",
+]
+
+[tool.uv]
+managed = true
+
+[dependency-groups]
+dev = [
+    "z3-solver>=5.4.1.0",
+]

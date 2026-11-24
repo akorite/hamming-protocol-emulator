@@ -1,0 +1,58 @@
+# Tiny Tapeout project information
+project:
+  title:        "Hamming - Reprogrammable Protocol Emulator"
+  author:       "akorite"
+  discord:      ""
+  description:  "Post-fabrication reprogrammable 4-core protocol emulator and hardware debugging engine with dual 2 KiB IHP SRAM banks"
+  language:     "Verilog"
+  clock_hz:     60000000
+
+  # How many tiles your design occupies? A single tile is about 202x155 uM.
+  tiles: "8x4"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2, 8x2, 3x4, 4x4, 5x4, 6x4 or 8x4
+
+  # Your top module name must start with "tt_um_". Make it unique by including your github username:
+  top_module:  "tt_um_akorite_hamming"
+
+  # List your project's source files here.
+  # Source files must be in ./src and you must list each source file separately, one per line.
+  # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
+  source_files:
+    - "project.v"
+    - "sram_bb.v"
+    - "hamming_sram_2kb.v"
+
+# The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
+# This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
+pinout:
+  # Inputs
+  ui[0]: "PROTO_IN0: protocol input (10BASE-T RX, UART RX, SPI, CAN, trigger)"
+  ui[1]: "PROTO_IN1: protocol input"
+  ui[2]: "PROTO_IN2: protocol input"
+  ui[3]: "PROTO_IN3: protocol input"
+  ui[4]: "PROTO_IN4: protocol input"
+  ui[5]: "HOST_CS_N: host SPI chip select (active low)"
+  ui[6]: "HOST_SCLK: host SPI clock (<= 5 MHz)"
+  ui[7]: "HOST_MOSI: host SPI data in"
+
+  # Outputs
+  uo[0]: "PROTO_OUT0: protocol output (10BASE-T TX+, UART TX, SPI, CAN)"
+  uo[1]: "PROTO_OUT1: protocol output (10BASE-T TX-)"
+  uo[2]: "PROTO_OUT2: protocol output"
+  uo[3]: "PROTO_OUT3: protocol output"
+  uo[4]: "PROTO_OUT4: protocol output"
+  uo[5]: "PROTO_OUT5: protocol output"
+  uo[6]: "PROTO_OUT6: protocol output"
+  uo[7]: "HOST_MISO: host SPI data out"
+
+  # Bidirectional pins
+  uio[0]: "PROTO_IO0: bidirectional protocol I/O (USB D+, I2C SDA, MITM)"
+  uio[1]: "PROTO_IO1: bidirectional protocol I/O (USB D-, I2C SCL)"
+  uio[2]: "PROTO_IO2: bidirectional protocol I/O"
+  uio[3]: "PROTO_IO3: bidirectional protocol I/O"
+  uio[4]: "PROTO_IO4: bidirectional protocol I/O"
+  uio[5]: "PROTO_IO5: bidirectional protocol I/O"
+  uio[6]: "PROTO_IO6: bidirectional protocol I/O"
+  uio[7]: "PROTO_IO7: bidirectional protocol I/O"
+
+# Do not change!
+yaml_version: 6
