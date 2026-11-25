@@ -120,6 +120,8 @@ def main():
         ("hamming_sram_arb", ["sram_bb.v", "hamming_sram_2kb.v", "hamming_sram_arb.v"]),
         ("hamming_icache", ["hamming_icache.v"]),
         ("hamming_core", ["hamming_icache.v", "hamming_core.v"]),
+        ("hamming_bcu_crc", ["hamming_bcu_crc.v"]),
+        ("hamming_lut_matrix", ["hamming_lut_matrix.v"]),
     ]
     unit_ff_counts = {}
     for unit_top, files in unit_modules:
@@ -152,6 +154,17 @@ def main():
         )
         if core_cache_ffs > 520:
             sys.exit(f"check_synth: core+cache {core_cache_ffs} FFs exceeds 520 budget")
+
+    # U5 plan gate: the LUT matrix, output router, and input synchronizers
+    # together must stay at or below 730 flip-flops.
+    if "hamming_lut_matrix" in unit_ff_counts:
+        lut_ffs, lut_cells = unit_ff_counts["hamming_lut_matrix"]
+        print(
+            f"check_synth: lut matrix+router+sync total: {lut_ffs} flip-flops "
+            f"(budget 730), {lut_cells} cells"
+        )
+        if lut_ffs > 730:
+            sys.exit(f"check_synth: lut matrix {lut_ffs} FFs exceeds 730 budget")
 
 
 if __name__ == "__main__":

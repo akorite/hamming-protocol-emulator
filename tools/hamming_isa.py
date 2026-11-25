@@ -206,6 +206,195 @@ READ_TIMER_HI = 1        # rd <= {deadline_missed, 11'b0, timer[19:16]}
 BCU_CRC_LO = 0
 BCU_CRC_HI = 1
 
+# ---------------------------------------------------------------------------
+# BCU configuration contracts (U5, KTD4)
+#
+# BCU_MODE[15:0] bit fields:
+#   [2:0]  codec        line coding engine select
+#   [4:3]  stuff        bit stuffing/unstuffing rule select
+#   [10:5] crc_width-1  CRC width minus one (0..31 selects 1..32 bits)
+#   [11]   crc_msb      0 = LSB-first reflected right-shift, 1 = MSB-first left
+#   [12]   crc_init1    crc_reset seeds state with all ones (masked to width)
+#   [13]   crc_xor1     final XOR of all ones applied to state at readout/TX
+#   [14]   crc_en       feed transfer bits into the CRC engine
+#   [15]   rx_diff      inputs are a differential pair with SE0 qualification
+#
+# BCU_CTRL[7:0] (persistent core control byte; arm bits are levels, the
+# strobe bits are edge-detected inside the BCU):
+#   [0] tx_arm      [1] rx_arm      [2] crc_reset   [3] tx_eop_req
+#   [4] stat_clear  [5] soft_reset  [7:6] reserved (write zero)
+#
+# BCU_DPLL_CFG[15:0]:
+#   [1:0]  mode     0 = none (free-running symbol clock), 1 = hard-snap
+#                   edge priority (USB), 2 = hold-off bit-center (Manchester)
+#   [3:2]  reserved (write zero)
+#   [7:4]  win      edge acceptance / hold-off window in cycles-1 (0 = 1)
+#   [15:8] period   symbol (bit cell) period in system cycles
+# ---------------------------------------------------------------------------
+
+BCU_CODEC = {
+    "nrz": 0, "nrzi": 1, "manchester": 2, "diff_manchester": 3, "pwm_rz": 4,
+}
+BCU_CODEC_NAMES = {v: k for k, v in BCU_CODEC.items()}
+
+BCU_STUFF = {"off": 0, "usb6": 1, "can5": 2}
+BCU_STUFF_NAMES = {v: k for k, v in BCU_STUFF.items()}
+
+BCU_CTRL_BITS = {
+    "tx_arm": 0, "rx_arm": 1, "crc_reset": 2, "tx_eop_req": 3,
+    "stat_clear": 4, "soft_reset": 5,
+}
+
+BCU_DPLL_MODE = {"none": 0, "hard_snap": 1, "hold_off": 2}
+BCU_DPLL_MODE_NAMES = {v: k for k, v in BCU_DPLL_MODE.items()}
+
+
+def pack_bcu_mode(codec="nrz", stuff="off", crc_width=32, crc_msb=0,
+                  crc_init1=0, crc_xor1=0, crc_en=0, rx_diff=0):
+    if isinstance(codec, str):
+        codec = BCU_CODEC[codec]
+    if isinstance(stuff, str):
+        stuff = BCU_STUFF[stuff]
+    assert 1 <= crc_width <= 32, "crc_width must be 1..32"
+    return ((codec & 0x7) | ((stuff & 0x3) << 3) |
+            ((crc_width - 1) << 5) | ((crc_msb & 1) << 11) |
+            ((crc_init1 & 1) << 12) | ((crc_xor1 & 1) << 13) |
+            ((crc_en & 1) << 14) | ((rx_diff & 1) << 15))
+
+
+def unpack_bcu_mode(mode):
+    return {
+        "codec": mode & 0x7,
+        "stuff": (mode >> 3) & 0x3,
+        "crc_width": ((mode >> 5) & 0x3F) + 1,
+        "crc_msb": (mode >> 11) & 1,
+        "crc_init1": (mode >> 12) & 1,
+        "crc_xor1": (mode >> 13) & 1,
+        "crc_en": (mode >> 14) & 1,
+        "rx_diff": (mode >> 15) & 1,
+    }
+
+
+def pack_dpll_cfg(mode="none", win=0, period=0):
+    if isinstance(mode, str):
+        mode = BCU_DPLL_MODE[mode]
+    assert 0 <= period <= 0xFF and 0 <= win <= 0xF
+    return (mode & 0x3) | ((win & 0xF) << 4) | ((period & 0xFF) << 8)
+
+
+# ---------------------------------------------------------------------------
+# Serial CRC reference model (single source for RTL and tests).
+#
+# Bit-serial LFSR fed one data bit per call. LSB-first mode uses the
+# reflected right-shift form (USB CRC5/CRC16, Ethernet CRC-32); MSB-first
+# mode uses the left-shift form (CAN CRC-15). `crc_reset` seeds either the
+# core-written CSR state or the all-ones init masked to width; `xor1`
+# applies the final all-ones XOR at readout.
+# ---------------------------------------------------------------------------
+
+def crc_width_mask(width):
+    return (1 << width) - 1 if width < 32 else 0xFFFFFFFF
+
+
+def crc_step_msb(state, bit, poly, width):
+    """Canonical MSB-first left-shift step (CRC-15 CAN style)."""
+    mask = crc_width_mask(width)
+    state &= mask
+    top = (state >> (width - 1)) & 1
+    fb = top ^ (bit & 1)
+    state = ((state << 1) & mask)
+    if fb:
+        state ^= (poly & mask)
+    return state & mask
+
+
+def crc_step_lsb(state, bit, poly, width):
+    """Canonical LSB-first reflected right-shift step (USB/Ethernet style)."""
+    mask = crc_width_mask(width)
+    state &= mask
+    fb = (state ^ bit) & 1
+    state >>= 1
+    if fb:
+        state ^= (poly & mask)
+    return state & mask
+
+
+def crc_step_ref(state, bit, poly, width, msb_first):
+    if msb_first:
+        return crc_step_msb(state, bit, poly, width)
+    return crc_step_lsb(state, bit, poly, width)
+
+
+def crc_compute(bits, poly, width, msb_first, init1, xor1):
+    """Reference CRC over a list of bits in wire order (first bit first)."""
+    mask = crc_width_mask(width)
+    state = mask if init1 else 0
+    for bit in bits:
+        state = crc_step_ref(state, bit, poly, width, msb_first)
+    if xor1:
+        state ^= mask
+    return state & mask
+
+
+# Protocol constants used by both the RTL tests and the firmware demos.
+CRC_USB5 = {"poly": 0x14, "width": 5, "msb_first": False,
+            "init1": True, "xor1": True, "residue": 0x06}
+CRC_USB16 = {"poly": 0xA001, "width": 16, "msb_first": False,
+             "init1": True, "xor1": True, "residue": 0xB001}
+CRC_ETH32 = {"poly": 0xEDB88320, "width": 32, "msb_first": False,
+             "init1": True, "xor1": True, "residue": 0xDEBB20E3}
+CRC_CAN15 = {"poly": 0x4599, "width": 15, "msb_first": True,
+             "init1": False, "xor1": False, "residue": 0x0000}
+
+# ---------------------------------------------------------------------------
+# LUT matrix mux source tables (U5, KTD5).
+#
+# Input-side pin ordering after synchronizer/glitch filter:
+#   pin index 0..7   uio_in[0..7]
+#   pin index 8..12  ui_in[0..4] (protocol dedicated inputs)
+#
+# Tier-1 (LUT 0..7) input sources, per-input 4-bit selector:
+#   0..12 filtered pin inputs, 13 replay bit, 14 host CS active, 15 const 0
+# Tier-2 (LUT 8..15) input sources:
+#   0..7 tier-1 outputs, 8..11 EV_FLAGS[3:0], 12 replay bit,
+#   13 host CS active, 14 const 1, 15 const 0
+#
+# Output router channels (23) in order:
+#   0..7   uio_out[0..7] data
+#   8..15  uio_oe[0..7]
+#   16..22 uo_out[0..6]
+# Router sources are uniform across channels in this first freeze; U7 demo
+# firmware validates reachability before the tables are final:
+#   0 const0     1 const1      2 replay     3 LUT8
+#   4 LUT9       5 LUT10      6 LUT11      7 LUT12
+#   8 LUT13      9 LUT14      10 LUT15     11 core_samebank_out
+#   12 bcu_samebank_tx_p  13 bcu_samebank_tx_n  14 bcu_samebank_tx_oe
+#   15 const0
+# core_samebank_out / bcu_samebank_* are the out[0]/tx signals of the core or
+# BCU the channel is statically paired with (uio channels pair by channel
+# index bit1:0, uo channels by channel index bit1:0), giving every core/BCU a
+# routable path on every pin group while the LUT tier-2 outputs cover the
+# programmable logic cases.
+# ---------------------------------------------------------------------------
+
+LUT_SRC_TIER1 = {
+    "pin0": 0, "pin1": 1, "pin2": 2, "pin3": 3, "pin4": 4, "pin5": 5,
+    "pin6": 6, "pin7": 7, "pin8": 8, "pin9": 9, "pin10": 10, "pin11": 11,
+    "pin12": 12, "replay": 13, "host_cs": 14, "zero": 15,
+}
+LUT_SRC_TIER2 = {
+    "lut0": 0, "lut1": 1, "lut2": 2, "lut3": 3, "lut4": 4, "lut5": 5,
+    "lut6": 6, "lut7": 7, "ev0": 8, "ev1": 9, "ev2": 10, "ev3": 11,
+    "replay": 12, "host_cs": 13, "one": 14, "zero": 15,
+}
+ROUTER_SRC = {
+    "zero": 0, "one": 1, "replay": 2, "lut8": 3, "lut9": 4, "lut10": 5,
+    "lut11": 6, "lut12": 7, "lut13": 8, "lut14": 9, "lut15": 10,
+    "core_out": 11, "bcu_tx_p": 12, "bcu_tx_n": 13, "bcu_tx_oe": 14,
+    "zero2": 15,
+}
+N_ROUTER_CHANNELS = 23
+
 ALL_MNEMONICS = (
     list(ALU_OPS) + ["ldi8"] + list(PIN_OPS) +
     ["wait_phase", "sync_event", "set_anchor", "read_timer"] +

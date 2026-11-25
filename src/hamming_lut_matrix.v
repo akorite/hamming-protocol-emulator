@@ -1,0 +1,200 @@
+/*
+ * Copyright (c) 2026 akorite
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+`timescale 1ns/1ps
+`default_nettype none
+
+// Fixed 2-tier (8 + 8) feedforward 16-LUT pin logic matrix with input
+// synchronizers, per-uio-pin 4-tap glitch filters, and the 23-channel
+// 16:1 output pin router (KTD5).  The structure is strictly feedforward:
+// tier-2 LUTs consume tier-1 outputs, never the reverse, so no
+// combinational loop can exist regardless of the CSR configuration.
+//
+// Router channel order:  0..7 uio_out data, 8..15 uio_oe, 16..22 uo_out.
+// Router sources: 0 const0, 1 const1, 2 replay, 3..10 LUT8..15,
+// 11 paired core out[0], 12/13/14 paired BCU tx_p/tx_n/tx_oe, 15 const0.
+// The core/BCU pairing uses channel index bits [1:0] so every core and BCU
+// has a routable path in each pin group.
+module hamming_lut_matrix (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    input  wire [7:0]  uio_in,
+    input  wire [4:0]  ui_in,
+
+    input  wire [7:0]  pin_filt_en,
+    input  wire [255:0] lut_tt_flat,
+    input  wire [255:0] lut_sel_flat,
+    input  wire [15:0] lut_oreg,
+    input  wire [95:0] pin_router_flat,
+    input  wire [7:0]  open_drain_en,
+
+    input  wire [7:0]  ev_flags,
+    input  wire        replay_bit,
+    input  wire        replay_active,
+    input  wire        host_cs_active,
+    input  wire [15:0] core_out_flat,   // 4 cores x out[3:0]
+    input  wire [3:0]  bcu_tx_p,
+    input  wire [3:0]  bcu_tx_n,
+    input  wire [3:0]  bcu_tx_oe,
+
+    output wire [15:0] pin_inputs,      // conditioned tier-1 source bus
+    output wire [15:0] lut_outputs,     // post-oreg LUT outputs (to cores)
+    output reg  [7:0]  uio_out,
+    output reg  [7:0]  uio_oe,
+    output reg  [6:0]  uo_out
+);
+
+  // ------------------------------------------------------------------------
+  // Input synchronizers and per-uio-pin 4-tap glitch filters.  A filtered
+  // output only changes when four consecutive samples agree, so spikes of
+  // three cycles (~50 ns at 60 MHz) or shorter are rejected while pulses
+  // reaching the 66.7 ns tap pass through.
+  // ------------------------------------------------------------------------
+
+  reg [12:0] sync1;
+  reg [12:0] sync2;
+  reg [3:0]  filt_hist [0:7];
+  reg [7:0]  filt_out;
+
+  wire [12:0] pins_raw = {ui_in, uio_in};
+
+  integer fi;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      sync1 <= 13'h0000;
+      sync2 <= 13'h0000;
+      filt_out <= 8'h00;
+      for (fi = 0; fi < 8; fi = fi + 1)
+        filt_hist[fi] <= 4'h0;
+    end else begin
+      sync1 <= pins_raw;
+      sync2 <= sync1;
+      for (fi = 0; fi < 8; fi = fi + 1) begin
+        filt_hist[fi] <= {filt_hist[fi][2:0], sync2[fi]};
+        if ({filt_hist[fi][2:0], sync2[fi]} == 4'b0000)
+          filt_out[fi] <= 1'b0;
+        else if ({filt_hist[fi][2:0], sync2[fi]} == 4'b1111)
+          filt_out[fi] <= 1'b1;
+      end
+    end
+  end
+
+  // Conditioned pin bus: uio pins use the filter output when enabled, the
+  // synchronizer output otherwise; ui_in pins are synchronizer-only.
+  wire [12:0] pins_cond;
+  genvar gp;
+  generate
+    for (gp = 0; gp < 8; gp = gp + 1) begin : gen_pin_cond
+      assign pins_cond[gp] = pin_filt_en[gp] ? filt_out[gp] : sync2[gp];
+    end
+    for (gp = 8; gp < 13; gp = gp + 1) begin : gen_pin_cond_ui
+      assign pins_cond[gp] = sync2[gp];
+    end
+  endgenerate
+
+  wire replay_gated = replay_bit & replay_active;
+
+  // ------------------------------------------------------------------------
+  // Tier source buses.
+  // ------------------------------------------------------------------------
+
+  wire [15:0] tier1_bus = {1'b0, host_cs_active, replay_gated, pins_cond};
+  assign pin_inputs = tier1_bus;
+
+  // ------------------------------------------------------------------------
+  // LUT evaluation.  lut_sel packs four 4-bit input selectors per LUT as
+  // {sel3, sel2, sel1, sel0} in bits [15:0] of each 16-bit lane; the truth
+  // table index is {in3, in2, in1, in0}.
+  // ------------------------------------------------------------------------
+
+  wire [15:0] lut_comb;
+  wire [15:0] tier2_bus = {1'b0, 1'b1, host_cs_active, replay_gated,
+                           ev_flags[3:0], lut_outputs[7:0]};
+
+  genvar gl;
+  generate
+    for (gl = 0; gl < 16; gl = gl + 1) begin : gen_lut
+      wire [15:0] tt  = lut_tt_flat[gl*16 +: 16];
+      wire [15:0] sel = lut_sel_flat[gl*16 +: 16];
+      wire [15:0] bus = (gl < 8) ? tier1_bus : tier2_bus;
+      wire        in0 = bus[sel[3:0]];
+      wire        in1 = bus[sel[7:4]];
+      wire        in2 = bus[sel[11:8]];
+      wire        in3 = bus[sel[15:12]];
+      assign lut_comb[gl] = tt[{in3, in2, in1, in0}];
+      reg out_r;
+      always @(posedge clk) begin
+        if (!rst_n)
+          out_r <= 1'b0;
+        else
+          out_r <= lut_comb[gl];
+      end
+      assign lut_outputs[gl] = lut_oreg[gl] ? out_r : lut_comb[gl];
+    end
+  endgenerate
+
+  // ------------------------------------------------------------------------
+  // 23-channel 16:1 output pin router.  All outputs are single-stage
+  // registered; the open-drain clamp forces the uio data channel low after
+  // source selection so open-drain pins only ever pull down.
+  // ------------------------------------------------------------------------
+
+  // Per-pair 16-entry router source buses.  Every signal is referenced
+  // directly in these continuous assignments so the mux evaluation tracks
+  // all of them in simulation (a function reading globals can hide them
+  // from the sensitivity).  Index map: 0 const0, 1 const1, 2 replay,
+  // 3..10 LUT8..15, 11 paired core out[0], 12/13/14 paired BCU tx_p/n/oe,
+  // 15 const0.
+  wire [7:0] lut_hi = lut_outputs[15:8];
+  wire [15:0] src_bus0 = {1'b0, bcu_tx_oe[0], bcu_tx_n[0], bcu_tx_p[0],
+                          core_out_flat[0], lut_hi[7], lut_hi[6], lut_hi[5],
+                          lut_hi[4], lut_hi[3], lut_hi[2], lut_hi[1], lut_hi[0],
+                          replay_gated, 1'b1, 1'b0};
+  wire [15:0] src_bus1 = {1'b0, bcu_tx_oe[1], bcu_tx_n[1], bcu_tx_p[1],
+                          core_out_flat[4], lut_hi[7], lut_hi[6], lut_hi[5],
+                          lut_hi[4], lut_hi[3], lut_hi[2], lut_hi[1], lut_hi[0],
+                          replay_gated, 1'b1, 1'b0};
+  wire [15:0] src_bus2 = {1'b0, bcu_tx_oe[2], bcu_tx_n[2], bcu_tx_p[2],
+                          core_out_flat[8], lut_hi[7], lut_hi[6], lut_hi[5],
+                          lut_hi[4], lut_hi[3], lut_hi[2], lut_hi[1], lut_hi[0],
+                          replay_gated, 1'b1, 1'b0};
+  wire [15:0] src_bus3 = {1'b0, bcu_tx_oe[3], bcu_tx_n[3], bcu_tx_p[3],
+                          core_out_flat[12], lut_hi[7], lut_hi[6], lut_hi[5],
+                          lut_hi[4], lut_hi[3], lut_hi[2], lut_hi[1], lut_hi[0],
+                          replay_gated, 1'b1, 1'b0};
+
+  integer ch;
+  reg [3:0] ch_sel;
+  reg [22:0] ch_out;
+  always @* begin
+    for (ch = 0; ch < 23; ch = ch + 1) begin
+      ch_sel = pin_router_flat[ch*4 +: 4];
+      case (ch[1:0])
+        2'd0:    ch_out[ch] = src_bus0[ch_sel];
+        2'd1:    ch_out[ch] = src_bus1[ch_sel];
+        2'd2:    ch_out[ch] = src_bus2[ch_sel];
+        default: ch_out[ch] = src_bus3[ch_sel];
+      endcase
+    end
+  end
+
+  integer ob;
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      uio_out <= 8'h00;
+      uio_oe  <= 8'h00;
+      uo_out  <= 7'h00;
+    end else begin
+      for (ob = 0; ob < 8; ob = ob + 1) begin
+        uio_out[ob] <= open_drain_en[ob] ? 1'b0 : ch_out[ob];
+        uio_oe[ob]  <= ch_out[8 + ob];
+      end
+      for (ob = 0; ob < 7; ob = ob + 1)
+        uo_out[ob] <= ch_out[16 + ob];
+    end
+  end
+
+endmodule
