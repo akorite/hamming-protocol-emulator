@@ -68,7 +68,10 @@ def lint_yosys_output(out, label):
     latches = sum(int(n) for n in re.findall(r"^\s+(\d+)\s+\$_DLATCH\w*\s*$", stat_text, re.M))
     if latches:
         sys.exit(f"check_synth: {label}: {latches} inferred latches")
-    return sum(int(n) for n in re.findall(r"^\s+(\d+)\s+\$_S?DFF\w*\s*$", stat_text, re.M))
+    ffs = sum(int(n) for n in re.findall(r"^\s+(\d+)\s+\$_S?DFF\w*\s*$", stat_text, re.M))
+    cell_counts = re.findall(r"^\s+(\d+) cells\s*$", stat_text, re.M)
+    cells = int(cell_counts[-1]) if cell_counts else 0
+    return ffs, cells
 
 
 def project_sources():
@@ -103,8 +106,8 @@ def main():
         "synth -top tt_um_akorite_hamming; check; stat -top tt_um_akorite_hamming"
     )
     out = run_yosys(script)
-    ffs = lint_yosys_output(out, "tt_um_akorite_hamming")
-    print(f"check_synth: {ffs} flip-flops (budget {FF_BUDGET}, ASIC only)")
+    ffs, cells = lint_yosys_output(out, "tt_um_akorite_hamming")
+    print(f"check_synth: {ffs} flip-flops, {cells} cells (FF budget {FF_BUDGET}, ASIC only)")
     if not args.fpga and ffs > FF_BUDGET:
         sys.exit(f"check_synth: {ffs} FFs exceeds {FF_BUDGET} budget")
 
@@ -115,7 +118,10 @@ def main():
         ("hamming_host_spi", ["hamming_host_spi.v"]),
         ("hamming_csr", ["hamming_csr.v"]),
         ("hamming_sram_arb", ["sram_bb.v", "hamming_sram_2kb.v", "hamming_sram_arb.v"]),
+        ("hamming_icache", ["hamming_icache.v"]),
+        ("hamming_core", ["hamming_icache.v", "hamming_core.v"]),
     ]
+    unit_ff_counts = {}
     for unit_top, files in unit_modules:
         if not all((SRC / f).exists() for f in files):
             continue
@@ -126,8 +132,26 @@ def main():
             f"{unit_read}; hierarchy -top {unit_top}; proc; "
             f"synth -top {unit_top}; check; stat -top {unit_top}"
         )
-        unit_ffs = lint_yosys_output(run_yosys(unit_script), unit_top)
-        print(f"check_synth: {unit_top}: {unit_ffs} flip-flops")
+        unit_ffs, unit_cells = lint_yosys_output(run_yosys(unit_script), unit_top)
+        unit_ff_counts[unit_top] = (unit_ffs, unit_cells)
+        print(f"check_synth: {unit_top}: {unit_ffs} flip-flops, {unit_cells} cells")
+
+    # U4 plan gate: one protocol core including its loop cache must stay at
+    # or below 520 flip-flops.  Yosys reports local counts, so the cache and
+    # core-local counts are summed exactly.  The plan's aggressive 2,200-cell
+    # target is reported visibility-only for now; correctness and lint remain
+    # hard gates while U5/U6 integration determines the final area budget.
+    if "hamming_core" in unit_ff_counts:
+        core_ffs, core_cells = unit_ff_counts["hamming_core"]
+        cache_ffs, cache_cells = unit_ff_counts.get("hamming_icache", (0, 0))
+        core_cache_ffs = core_ffs + cache_ffs
+        core_cache_cells = core_cells + cache_cells
+        print(
+            f"check_synth: core+cache total: {core_cache_ffs} flip-flops "
+            f"(budget 520), {core_cache_cells} cells (target < 2200)"
+        )
+        if core_cache_ffs > 520:
+            sys.exit(f"check_synth: core+cache {core_cache_ffs} FFs exceeds 520 budget")
 
 
 if __name__ == "__main__":
