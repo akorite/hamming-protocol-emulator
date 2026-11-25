@@ -373,9 +373,9 @@ async def test_host_spi_csr_config_and_core_ownership(dut):
 
     await spi_write_burst(dut, CMD_WR_CSR, CSR_CTRL_RUN, [0x000B], 16)
     assert u(dut.ctrl_run) == 0xB
-    await spi_write_burst(dut, CMD_WR_CSR, CSR_RLE_BASE, [0x0200, 0x01FF], 16)
-    assert u(dut.rle_base) == 0x0200
-    assert u(dut.rle_mask) == 0x01FF
+    await spi_write_burst(dut, CMD_WR_CSR, CSR_RLE_BASE, [0x0100, 0x00FF], 16)
+    assert u(dut.rle_base) == 0x0100
+    assert u(dut.rle_mask) == 0x00FF
 
     # Host writes also reach every private core/BCU configuration bank.
     await spi_write_burst(dut, CMD_WR_CSR, CSR_CORE_BANK + 2 * 16 + 4, [0xCAFE], 16)

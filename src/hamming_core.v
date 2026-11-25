@@ -81,11 +81,10 @@ module hamming_core #(
   reg [1:0] call_depth;
 
   reg        wait_active;
-  reg [19:0] wait_deadline;
+  reg [19:0] stall_cnt;   // shared: WAIT deadline latch / SYNC countdown
 
   reg        sync_active;
   reg [3:0]  sync_mask;
-  reg [15:0] sync_left;
 
   reg [1:0]  mem_state;
   reg [1:0]  mem_rt_r;
@@ -276,7 +275,7 @@ module hamming_core #(
   wire [19:0] wait_delta = {4'h0, wait_delta16} & `HAM_MAX_WAIT_DELTA;
   wire [19:0] wait_new_deadline = anchor + wait_delta;
   wire [19:0] wait_new_diff = timer - wait_new_deadline;
-  wire [19:0] wait_cur_diff = timer - wait_deadline;
+  wire [19:0] wait_cur_diff = timer - stall_cnt;
 
   assign core_pc_out = pc;
   assign core_status = {11'h000, halted_r, deadline_missed, eq, c, z};
@@ -309,10 +308,9 @@ module hamming_core #(
       call1 <= 10'h000;
       call_depth <= 2'd0;
       wait_active <= 1'b0;
-      wait_deadline <= 20'h00000;
+      stall_cnt <= 20'h00000;
       sync_active <= 1'b0;
       sync_mask <= 4'h0;
-      sync_left <= 16'h0000;
       mem_state <= MEM_NONE;
       mem_rt_r <= 2'b00;
       mem_lane <= 2'b00;
@@ -340,12 +338,12 @@ module hamming_core #(
           pc <= pc + 10'd1;
         end
       end else if (sync_active) begin
-        if (((ev_flags & sync_mask) != 8'h00) || (sync_left <= 16'd1)) begin
+        if (((ev_flags & sync_mask) != 8'h00) || (stall_cnt[15:0] <= 16'd1)) begin
           sync_active <= 1'b0;
           anchor <= timer;
           pc <= pc + 10'd1;
         end else begin
-          sync_left <= sync_left - 16'd1;
+          stall_cnt <= stall_cnt - 20'd1;
         end
       end else if (mem_state == MEM_DWRITE) begin
         mem_state <= MEM_NONE;
@@ -463,7 +461,7 @@ module hamming_core #(
               if (sub == `HAM_TIM_WAIT_PHASE_RS || sub == `HAM_TIM_WAIT_PHASE_IMM) begin
                 if (wait_new_diff[19]) begin
                   wait_active <= 1'b1;
-                  wait_deadline <= wait_new_deadline;
+                  stall_cnt <= wait_new_deadline;
                   pc <= pc;
                 end else if (wait_new_diff != 20'h00000) begin
                   deadline_missed <= 1'b1;
@@ -474,7 +472,7 @@ module hamming_core #(
                 end else begin
                   sync_active <= 1'b1;
                   sync_mask <= instr[7:4];
-                  sync_left <= rf_32;
+                  stall_cnt <= {4'h0, rf_32};
                   pc <= pc;
                 end
               end else if (sub == `HAM_TIM_SET_ANCHOR) begin

@@ -68,7 +68,7 @@ module hamming_sram_arb #(
   reg        ren_r;
   reg [8:0]  addr_r;
   reg [31:0] din_r;
-  reg [31:0] bm_r;
+  reg [3:0]  bm4_r;   // byte-lane mask; clients are byte-aligned
   wire [31:0] dout;
 
   // Return-tag pipeline. A read accepted at edge T has its macro data before
@@ -89,7 +89,7 @@ module hamming_sram_arb #(
       ren_r        <= 1'b0;
       addr_r       <= 9'd0;
       din_r        <= 32'd0;
-      bm_r         <= 32'd0;
+      bm4_r        <= 4'd0;
       write_commit <= 1'b0;
       v0           <= 1'b0;
       v1           <= 1'b0;
@@ -107,7 +107,8 @@ module hamming_sram_arb #(
         ren_r  <= !we[sel];
         addr_r <= addr_flat[sel*9 +: 9];
         din_r  <= wdata_flat[sel*32 +: 32];
-        bm_r   <= wmask_flat[sel*32 +: 32];
+        bm4_r  <= {|wmask_flat[sel*32+24 +: 8], |wmask_flat[sel*32+16 +: 8],
+                     |wmask_flat[sel*32+8 +: 8],  |wmask_flat[sel*32 +: 8]};
         rr_base <= (sel == NCLIENTS-1) ? {CLIENT_W{1'b0}} : sel + 1'b1;
       end else begin
         men_r <= 1'b0;
@@ -144,7 +145,7 @@ module hamming_sram_arb #(
       .ren (ren_r),
       .addr(addr_r),
       .din (din_r),
-      .bm  (bm_r),
+      .bm  ({{8{bm4_r[3]}}, {8{bm4_r[2]}}, {8{bm4_r[1]}}, {8{bm4_r[0]}}}),
       .dout(dout)
   );
 

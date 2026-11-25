@@ -177,6 +177,31 @@ def test_nrz_loopback_msb():
          module="cocotb_bcu_top")
 
 
+def test_extclk_lsb_nonpalindromic():
+    _run("test_extclk_lsb_nonpalindromic", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_extclk_msb_nonpalindromic():
+    _run("test_extclk_msb_nonpalindromic", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_extclk_lsb_partial_len():
+    _run("test_extclk_lsb_partial_len", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_extclk_lsb_16bit():
+    _run("test_extclk_lsb_16bit", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_extclk_frame_continuity():
+    _run("test_extclk_frame_continuity", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
 def test_nrzi_loopback_diff():
     _run("test_nrzi_loopback_diff", _build_bcu, "hamming_bcu",
          module="cocotb_bcu_top")

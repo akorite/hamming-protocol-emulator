@@ -87,10 +87,10 @@ module hamming_csr (
   reg [3:0]  ctrl_run_r;
   reg [7:0]  ev_flags_r;
   reg [19:0] timer_r;
-  reg [15:0] rle_ctrl_r;
+  reg [6:0]  rle_ctrl_r;
   reg [15:0] rle_probe_mask_r;
-  reg [15:0] rle_base_r;
-  reg [15:0] rle_mask_r;
+  reg [8:0]  rle_base_r;
+  reg [8:0]  rle_mask_r;
   reg [7:0]  pin_filt_en_r;
   reg [7:0]  open_drain_en_r;
   reg [15:0] pin_router_r [0:5];
@@ -100,16 +100,16 @@ module hamming_csr (
 
   reg [15:0] bcu_mode_r      [0:3];
   reg [31:0] bcu_crc_poly_r  [0:3];
-  reg [15:0] bcu_bit_len_r   [0:3];
+  reg [4:0]  bcu_bit_len_r  [0:3];
   reg [15:0] bcu_pat_match_r [0:3];
-  reg [15:0] bcu_pat_len_r   [0:3];
-  reg [15:0] bcu_dpll_cfg_r  [0:3];
+  reg [3:0]  bcu_pat_len_r  [0:3];
+  reg [13:0] bcu_dpll_cfg_r  [0:3];
 
   assign ctrl_run     = ctrl_run_r;
   assign ev_flags     = ev_flags_r;
   assign timer        = timer_r;
-  assign rle_base     = rle_base_r;
-  assign rle_mask     = rle_mask_r;
+  assign rle_base     = {7'b0, rle_base_r};
+  assign rle_mask     = {7'b0, rle_mask_r};
   assign pin_filt_en  = pin_filt_en_r;
   assign open_drain_en = open_drain_en_r;
   assign lut_oreg     = lut_oreg_r;
@@ -127,10 +127,10 @@ module hamming_csr (
       assign bcu_mode_flat[go*16 +: 16]       = bcu_mode_r[go];
       assign bcu_crc_poly_flat[go*32 +: 32]   = bcu_crc_poly_r[go];
       assign bcu_crc_state_flat[go*32 +: 32] = bcu_crc_live_flat[go*32 +: 32];
-      assign bcu_bit_len_flat[go*16 +: 16]    = bcu_bit_len_r[go];
+      assign bcu_bit_len_flat[go*16 +: 16]    = {11'b0, bcu_bit_len_r[go]};
       assign bcu_pat_match_flat[go*16 +: 16]  = bcu_pat_match_r[go];
-      assign bcu_pat_len_flat[go*16 +: 16]    = bcu_pat_len_r[go];
-      assign bcu_dpll_cfg_flat[go*16 +: 16]   = bcu_dpll_cfg_r[go];
+      assign bcu_pat_len_flat[go*16 +: 16]    = {12'b0, bcu_pat_len_r[go]};
+      assign bcu_dpll_cfg_flat[go*16 +: 16]   = {bcu_dpll_cfg_r[go][13:2], 2'b00, bcu_dpll_cfg_r[go][1:0]};
       assign bcu_tx_data_flat[go*16 +: 16] = 16'h0000;
     end
   endgenerate
@@ -165,10 +165,10 @@ module hamming_csr (
           4'h6: read_value = bcu_crc_poly_r[read_bank][31:16];
           4'h7: read_value = bcu_crc_live_flat[read_bank*32 +: 16];
           4'h8: read_value = bcu_crc_live_flat[read_bank*32+16 +: 16];
-          4'h9: read_value = bcu_bit_len_r[read_bank];
+          4'h9: read_value = {11'b0, bcu_bit_len_r[read_bank]};
           4'hA: read_value = bcu_pat_match_r[read_bank];
-          4'hB: read_value = bcu_pat_len_r[read_bank];
-          4'hC: read_value = bcu_dpll_cfg_r[read_bank];
+          4'hB: read_value = {12'b0, bcu_pat_len_r[read_bank]};
+          4'hC: read_value = {bcu_dpll_cfg_r[read_bank][13:2], 2'b00, bcu_dpll_cfg_r[read_bank][1:0]};
           4'hD: read_value = 16'h0000;
           4'hE: read_value = bcu_rx_data_flat[read_bank*16 +: 16];
           4'hF: read_value = bcu_stat_flat[read_bank*16 +: 16];
@@ -184,10 +184,10 @@ module hamming_csr (
           CSR_EV_FLAGS:      read_value = {8'b0, ev_flags_r};
           CSR_TIMER_LO:      read_value = timer_r[15:0];
           CSR_TIMER_HI:      read_value = {12'b0, timer_r[19:16]};
-          CSR_RLE_BASE:      read_value = rle_base_r;
-            CSR_RLE_CTRL:      read_value = rle_ctrl_r;
+          CSR_RLE_BASE:      read_value = {7'b0, rle_base_r};
+            CSR_RLE_CTRL:      read_value = {9'b0, rle_ctrl_r};
             CSR_RLE_PROBE_MASK: read_value = rle_probe_mask_r;
-          CSR_RLE_MASK:      read_value = rle_mask_r;
+          CSR_RLE_MASK:      read_value = {7'b0, rle_mask_r};
           CSR_RLE_WR_PTR:    read_value = rle_wr_ptr;
           CSR_RLE_STATUS:    read_value = rle_status;
           CSR_PIN_FILT_EN:   read_value = {8'b0, pin_filt_en_r};
@@ -228,10 +228,10 @@ module hamming_csr (
         4'h4: bcu_mode_r[bank] <= value;
         4'h5: bcu_crc_poly_r[bank][15:0] <= value;
         4'h6: bcu_crc_poly_r[bank][31:16] <= value;
-        4'h9: bcu_bit_len_r[bank] <= value;
+        4'h9: bcu_bit_len_r[bank] <= value[4:0];
         4'hA: bcu_pat_match_r[bank] <= value;
-        4'hB: bcu_pat_len_r[bank] <= value;
-        4'hC: bcu_dpll_cfg_r[bank] <= value;
+        4'hB: bcu_pat_len_r[bank] <= value[3:0];
+        4'hC: bcu_dpll_cfg_r[bank] <= {value[15:4], value[1:0]};
         default: begin end
       endcase
     end
@@ -330,9 +330,9 @@ module hamming_csr (
           case (host_addr)
             CSR_CTRL_RUN:      ctrl_run_r <= host_wdata[3:0];
             CSR_EV_FLAGS:      ev_flags_r <= host_wdata[7:0];
-            CSR_RLE_BASE:      rle_base_r <= host_wdata;
-            CSR_RLE_MASK:      rle_mask_r <= host_wdata;
-            CSR_RLE_CTRL:      rle_ctrl_r <= host_wdata;
+            CSR_RLE_BASE:      rle_base_r <= host_wdata[8:0];
+            CSR_RLE_MASK:      rle_mask_r <= host_wdata[8:0];
+            CSR_RLE_CTRL:      rle_ctrl_r <= host_wdata[6:0];
             CSR_RLE_PROBE_MASK: rle_probe_mask_r <= host_wdata;
             CSR_PIN_FILT_EN:   pin_filt_en_r <= host_wdata[7:0];
             CSR_OPEN_DRAIN_EN: open_drain_en_r <= host_wdata[7:0];
@@ -341,7 +341,7 @@ module hamming_csr (
             CSR_PIN_ROUTER0+2: pin_router_r[2] <= host_wdata;
             CSR_PIN_ROUTER0+3: pin_router_r[3] <= host_wdata;
             CSR_PIN_ROUTER0+4: pin_router_r[4] <= host_wdata;
-            CSR_PIN_ROUTER0+5: pin_router_r[5] <= host_wdata;
+            CSR_PIN_ROUTER0+5: pin_router_r[5] <= {4'b0000, host_wdata[11:0]};
             CSR_LUT_OREG:      lut_oreg_r <= host_wdata;
             default: begin end
           endcase
@@ -394,7 +394,7 @@ module hamming_csr (
     end
   end
 
-  assign rle_ctrl = rle_ctrl_r;
+  assign rle_ctrl = {9'b0, rle_ctrl_r};
   assign rle_probe_mask = rle_probe_mask_r;
 
 endmodule

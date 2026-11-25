@@ -206,7 +206,6 @@ module hamming_bcu (
     // RX engine state
     // ---------------------------------------------------------------------
     reg [15:0] rx_shift;
-    reg [15:0] mat_shift;  // time-ordered matcher tap, newest bit at bit0
     reg [15:0] rx_shadow;
     reg [4:0]  rx_cnt;
     reg        rx_full;
@@ -253,6 +252,7 @@ module hamming_bcu (
         reg       rbit;
         reg       rvalid;
         reg [15:0] sh_next;
+        reg [15:0] rev16;
 
         if (!rst_n) begin
             txs          <= TXS_IDLE;
@@ -272,7 +272,6 @@ module hamming_bcu (
             tx_oe        <= 1'b0;
             tx_sym_cnt   <= 9'd0;
             rx_shift     <= 16'h0;
-            mat_shift    <= 16'h0;
             rx_shadow    <= 16'h0;
             rx_cnt       <= 5'd0;
             rx_full      <= 1'b0;
@@ -580,7 +579,6 @@ module hamming_bcu (
             // ---------------------------------------------------------
             if (soft_rst_pulse || !ctl_rx_arm) begin
                 rx_shift   <= 16'h0;
-                mat_shift  <= 16'h0;
                 rx_cnt     <= 5'd0;
                 rx_run_cnt <= 3'd0;
                 rx_skip    <= 1'b0;
@@ -659,21 +657,14 @@ module hamming_bcu (
                                 rx_run_val <= rbit;
                             end
 
-                            // Reassembly: MSB-first shifts left so the
-                            // first wire bit lands at bit len-1; LSB-first
-                            // inserts at the bit-count index so the first
-                            // wire bit stays at bit 0.
-                            if (wire_msb)
-                                sh_next = {rx_shift[14:0], rbit};
-                            else
-                                sh_next = (rx_cnt == 5'd0 ? 16'h0000 :
-                                           rx_shift) |
-                                          (rbit ? (16'h0001 << rx_cnt[3:0])
-                                                : 16'h0000);
+                            // Reassembly is time-ordered in both bit
+                            // orders: the newest wire bit enters at bit 0.
+                            // This doubles as the pattern-match window;
+                            // LSB-first frames reverse/align at completion.
+                            sh_next   = {rx_shift[14:0], rbit};
                             rx_shift  <= sh_next;
-                            mat_shift <= {mat_shift[14:0], rbit};
                             if ((cfg_pat_len[3:0] != 4'd0) &&
-                                (({mat_shift[14:0], rbit} & pat_mask) ==
+                                ((sh_next & pat_mask) ==
                                  (cfg_pat_match & pat_mask)))
                                 st_sfd <= 1'b1;
                             if (crc_en) begin
@@ -681,7 +672,19 @@ module hamming_bcu (
                                 crc_bit  <= rbit;
                             end
                             if (rx_cnt == (xfr_len - 5'd1)) begin
-                                rx_shadow <= sh_next;
+                                if (wire_msb) begin
+                                    rx_shadow <= sh_next;
+                                end else begin
+                                    rev16 = {sh_next[0], sh_next[1],
+                                             sh_next[2], sh_next[3],
+                                             sh_next[4], sh_next[5],
+                                             sh_next[6], sh_next[7],
+                                             sh_next[8], sh_next[9],
+                                             sh_next[10], sh_next[11],
+                                             sh_next[12], sh_next[13],
+                                             sh_next[14], sh_next[15]};
+                                    rx_shadow <= rev16 >> (5'd16 - xfr_len);
+                                end
                                 rx_full   <= 1'b1;
                                 rx_cnt    <= 5'd0;
                             end else begin

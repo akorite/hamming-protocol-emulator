@@ -29,6 +29,7 @@ module hamming_lut_matrix (
 
     input  wire [7:0]  uio_in,
     input  wire [4:0]  ui_in,
+    input  wire        ena,          // chip selected; low clamps outputs
 
     input  wire [7:0]  pin_filt_en,
     input  wire [255:0] lut_tt_flat,
@@ -63,7 +64,7 @@ module hamming_lut_matrix (
 
   reg [12:0] sync1;
   reg [12:0] sync2;
-  reg [3:0]  filt_hist [0:7];
+  reg [2:0]  filt_hist [0:7];   // newest tap is sync2 itself
   reg [7:0]  filt_out;
 
   wire [12:0] pins_raw = {ui_in, uio_in};
@@ -75,15 +76,15 @@ module hamming_lut_matrix (
       sync2 <= 13'h0000;
       filt_out <= 8'h00;
       for (fi = 0; fi < 8; fi = fi + 1)
-        filt_hist[fi] <= 4'h0;
+        filt_hist[fi] <= 3'h0;
     end else begin
       sync1 <= pins_raw;
       sync2 <= sync1;
       for (fi = 0; fi < 8; fi = fi + 1) begin
-        filt_hist[fi] <= {filt_hist[fi][2:0], sync2[fi]};
-        if ({filt_hist[fi][2:0], sync2[fi]} == 4'b0000)
+        filt_hist[fi] <= {filt_hist[fi][1:0], sync2[fi]};
+        if ({filt_hist[fi], sync2[fi]} == 4'b0000)
           filt_out[fi] <= 1'b0;
-        else if ({filt_hist[fi][2:0], sync2[fi]} == 4'b1111)
+        else if ({filt_hist[fi], sync2[fi]} == 4'b1111)
           filt_out[fi] <= 1'b1;
       end
     end
@@ -214,6 +215,11 @@ module hamming_lut_matrix (
   integer ob;
   always @(posedge clk) begin
     if (!rst_n) begin
+      uio_out <= 8'h00;
+      uio_oe  <= 8'h00;
+      uo_out  <= 7'h00;
+    end else if (!ena) begin
+      // R3: deselection releases every pin inside the single leaf stage.
       uio_out <= 8'h00;
       uio_oe  <= 8'h00;
       uo_out  <= 7'h00;

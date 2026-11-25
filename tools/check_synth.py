@@ -108,8 +108,7 @@ def main():
     out = run_yosys(script)
     ffs, cells = lint_yosys_output(out, "tt_um_akorite_hamming")
     print(f"check_synth: {ffs} flip-flops, {cells} cells (FF budget {FF_BUDGET}, ASIC only)")
-    if not args.fpga and ffs > FF_BUDGET:
-        sys.exit(f"check_synth: {ffs} FFs exceeds {FF_BUDGET} budget")
+    over_budget = (not args.fpga) and ffs > FF_BUDGET
 
     # Units not yet instantiated by the integration top still receive a real
     # elaboration/synthesis lint here. Merely reading them into the top-level
@@ -182,6 +181,9 @@ def main():
         )
         if bcu_ffs > 270:
             sys.exit(f"check_synth: bcu {bcu_ffs} FFs exceeds 270 budget")
+
+    if over_budget:
+        sys.exit(f"check_synth: {ffs} FFs exceeds {FF_BUDGET} budget")
 
 
 if __name__ == "__main__":

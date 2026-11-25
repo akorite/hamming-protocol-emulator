@@ -12,7 +12,7 @@
 // Command format: CMD, 16-bit big-endian byte address, then payload. SRAM
 // payloads are 32-bit words at aligned byte addresses; CSR payloads are
 // 16-bit values. Reads use one mandatory dummy byte. MISO changes only on
-// synchronized SCLK falling edges and is driven directly by rd_shift[31].
+// synchronized SCLK falling edges and is driven directly by io_shift[31].
 module hamming_host_spi (
     input  wire        clk,
     input  wire        rst_n,
@@ -24,18 +24,18 @@ module hamming_host_spi (
 
     output wire        sram0_req,
     output wire        sram0_we,
-    output reg  [8:0]  sram0_addr,
-    output reg  [31:0] sram0_wdata,
-    output reg  [31:0] sram0_wmask,
+    output wire [8:0]  sram0_addr,
+    output wire [31:0] sram0_wdata,
+    output wire [31:0] sram0_wmask,
     input  wire        sram0_grant,
     input  wire        sram0_rvalid,
     input  wire [31:0] sram0_rdata,
 
     output wire        sram1_req,
     output wire        sram1_we,
-    output reg  [8:0]  sram1_addr,
-    output reg  [31:0] sram1_wdata,
-    output reg  [31:0] sram1_wmask,
+    output wire [8:0]  sram1_addr,
+    output wire [31:0] sram1_wdata,
+    output wire [31:0] sram1_wmask,
     input  wire        sram1_grant,
     input  wire        sram1_rvalid,
     input  wire [31:0] sram1_rdata,
@@ -108,14 +108,25 @@ module hamming_host_spi (
     end
   end
 
+  // Shared SRAM write/read bus: a command targets exactly one bank, so a
+  // single register set drives both banks' inputs.  Host SPI writes full
+  // words only, so the byte mask is constant.
+  reg [8:0]  sh_addr;
+  reg [31:0] sh_wdata;
+  assign sram0_addr  = sh_addr;
+  assign sram1_addr  = sh_addr;
+  assign sram0_wdata = sh_wdata;
+  assign sram1_wdata = sh_wdata;
+  assign sram0_wmask = 32'hFFFFFFFF;
+  assign sram1_wmask = 32'hFFFFFFFF;
+
   reg [2:0]  state;
   reg [2:0]  dummy_cnt;
   reg [4:0]  bit_cnt;
   reg [4:0]  out_bit_cnt;
   reg [15:0] addr_shift;
   reg [7:0]  cmd_shift;
-  reg [30:0] wr_shift;
-  reg [31:0] rd_shift;
+  reg [31:0] io_shift;   // shared write-assemble / read-shift (exclusive states)
   reg [31:0] rd_word;
   reg        rd_word_valid;
   reg        preload_pending;
@@ -123,8 +134,7 @@ module hamming_host_spi (
   reg        target_sram0;
   reg        target_sram1;
   reg        target_write;
-  reg [8:0]  write_burst_addr;
-  reg [8:0]  read_burst_addr;
+  reg [8:0]  burst_addr;   // shared write/read auto-increment (exclusive)
   reg [7:0]  csr_burst_addr;
   reg        wr0_pending;
   reg        wr1_pending;
@@ -134,8 +144,8 @@ module hamming_host_spi (
 
   wire [7:0]  cmd_next  = {cmd_shift[6:0], mosi_sync};
   wire [15:0] addr_next = {addr_shift[14:0], mosi_sync};
-  wire [31:0] write_word = {wr_shift[30:0], mosi_sync};
-  wire [15:0] csr_write_word = {wr_shift[14:0], mosi_sync};
+  wire [31:0] write_word = {io_shift[30:0], mosi_sync};
+  wire [15:0] csr_write_word = {io_shift[14:0], mosi_sync};
 
   wire read_grant = read_req_pending &&
                     (read_bank ? sram1_grant : sram0_grant);
@@ -151,7 +161,7 @@ module hamming_host_spi (
   assign sram1_we  = wr1_pending;
 
   // MISO is exactly one flip-flop stage: it is the registered shift msb.
-  assign host_miso = rd_shift[31];
+  assign host_miso = io_shift[31];
 
   always @(posedge clk) begin
     if (!rst_n) begin
@@ -161,8 +171,7 @@ module hamming_host_spi (
       out_bit_cnt <= 5'd0;
       addr_shift <= 16'h0000;
       cmd_shift <= 8'h00;
-      wr_shift <= 31'h00000000;
-      rd_shift <= 32'h00000000;
+      io_shift <= 32'h00000000;
       rd_word <= 32'h00000000;
       rd_word_valid <= 1'b0;
       preload_pending <= 1'b0;
@@ -170,20 +179,15 @@ module hamming_host_spi (
       target_sram0 <= 1'b0;
       target_sram1 <= 1'b0;
       target_write <= 1'b0;
-      write_burst_addr <= 9'h000;
-      read_burst_addr <= 9'h000;
+      burst_addr <= 9'h000;
       csr_burst_addr <= 8'h00;
       wr0_pending <= 1'b0;
       wr1_pending <= 1'b0;
       read_req_pending <= 1'b0;
       read_wait_pending <= 1'b0;
       read_bank <= 1'b0;
-      sram0_addr <= 9'h000;
-      sram0_wdata <= 32'h00000000;
-      sram0_wmask <= 32'hFFFFFFFF;
-      sram1_addr <= 9'h000;
-      sram1_wdata <= 32'h00000000;
-      sram1_wmask <= 32'hFFFFFFFF;
+      sh_addr <= 9'h000;
+      sh_wdata <= 32'h00000000;
       csr_we <= 1'b0;
       csr_addr <= 8'h00;
       csr_wdata <= 16'h0000;
@@ -211,7 +215,7 @@ module hamming_host_spi (
         bit_cnt <= 5'd0;
         out_bit_cnt <= 5'd0;
         dummy_cnt <= 3'd0;
-        rd_shift <= 32'h00000000;
+        io_shift <= 32'h00000000;
         rd_word_valid <= 1'b0;
         preload_pending <= 1'b0;
         read_req_pending <= 1'b0;
@@ -223,8 +227,7 @@ module hamming_host_spi (
         dummy_cnt <= 3'd7;
         cmd_shift <= 8'h00;
         addr_shift <= 16'h0000;
-        wr_shift <= 31'h00000000;
-        rd_shift <= 32'h00000000;
+        io_shift <= 32'h00000000;
         rd_word_valid <= 1'b0;
         preload_pending <= 1'b0;
         target_csr <= 1'b0;
@@ -271,18 +274,18 @@ module hamming_host_spi (
                     read_req_pending <= 1'b1;
                     read_wait_pending <= 1'b0;
                     read_bank <= (cmd_shift == CMD_RD_SRAM1);
-                    read_burst_addr <= addr_next[10:2] + 9'd1;
+                    burst_addr <= addr_next[10:2] + 9'd1;
                     if (cmd_shift == CMD_RD_SRAM1)
-                      sram1_addr <= addr_next[10:2];
+                      sh_addr <= addr_next[10:2];
                     else
-                      sram0_addr <= addr_next[10:2];
+                      sh_addr <= addr_next[10:2];
                   end
                 end else if (cmd_shift == CMD_WR_SRAM0 || cmd_shift == CMD_WR_SRAM1 ||
                              cmd_shift == CMD_WR_CSR) begin
                   state <= ST_WRITE;
                   bit_cnt <= (cmd_shift == CMD_WR_CSR) ? 5'd15 : 5'd31;
-                  wr_shift <= 31'h00000000;
-                  write_burst_addr <= addr_next[10:2];
+                  io_shift <= 32'h00000000;
+                  burst_addr <= addr_next[10:2];
                 end else begin
                   state <= ST_IDLE;
                 end
@@ -307,23 +310,21 @@ module hamming_host_spi (
             end
 
             ST_WRITE: begin
-              wr_shift <= {wr_shift[29:0], mosi_sync};
+              io_shift <= {io_shift[30:0], mosi_sync};
               if (bit_cnt != 5'd0) begin
                 bit_cnt <= bit_cnt - 1'b1;
               end else begin
                 if (target_sram0 || target_sram1) begin
                   if (target_sram0) begin
                     wr0_pending <= 1'b1;
-                    sram0_wdata <= write_word;
-                    sram0_wmask <= 32'hFFFFFFFF;
-                    sram0_addr <= write_burst_addr;
+                    sh_wdata <= write_word;
+                    sh_addr <= burst_addr;
                   end else begin
                     wr1_pending <= 1'b1;
-                    sram1_wdata <= write_word;
-                    sram1_wmask <= 32'hFFFFFFFF;
-                    sram1_addr <= write_burst_addr;
+                    sh_wdata <= write_word;
+                    sh_addr <= burst_addr;
                   end
-                  write_burst_addr <= write_burst_addr + 9'd1;
+                  burst_addr <= burst_addr + 9'd1;
                   bit_cnt <= 5'd31;
                 end else if (target_csr) begin
                   csr_we <= 1'b1;
@@ -334,7 +335,7 @@ module hamming_host_spi (
                 end else begin
                   state <= ST_IDLE;
                 end
-                wr_shift <= 31'h00000000;
+                io_shift <= 32'h00000000;
               end
             end
 
@@ -351,18 +352,18 @@ module hamming_host_spi (
           if (preload_pending) begin
             preload_pending <= 1'b0;
             if (target_csr) begin
-              rd_shift <= {csr_rdata, 16'h0000};
+              io_shift <= {csr_rdata, 16'h0000};
             end else if (rd_word_valid) begin
-              rd_shift <= rd_word;
+              io_shift <= rd_word;
               rd_word_valid <= 1'b0;
               read_req_pending <= 1'b1;
               if (read_bank)
-                sram1_addr <= read_burst_addr;
+                sh_addr <= burst_addr;
               else
-                sram0_addr <= read_burst_addr;
-              read_burst_addr <= read_burst_addr + 9'd1;
+                sh_addr <= burst_addr;
+              burst_addr <= burst_addr + 9'd1;
             end else begin
-              rd_shift <= 32'h00000000;
+              io_shift <= 32'h00000000;
             end
           end else if (out_bit_cnt == 5'd0) begin
             // The final bit was sampled on the preceding rising edge. Load
@@ -370,31 +371,31 @@ module hamming_host_spi (
             // next bit period.
             if (target_csr) begin
               out_bit_cnt <= 5'd15;
-              rd_shift <= {csr_rdata, 16'h0000};
+              io_shift <= {csr_rdata, 16'h0000};
             end else begin
               out_bit_cnt <= 5'd31;
               if (rd_word_valid) begin
-                rd_shift <= rd_word;
+                io_shift <= rd_word;
                 rd_word_valid <= 1'b0;
                 read_req_pending <= 1'b1;
                 if (read_bank)
-                  sram1_addr <= read_burst_addr;
+                  sh_addr <= burst_addr;
                 else
-                  sram0_addr <= read_burst_addr;
-                read_burst_addr <= read_burst_addr + 9'd1;
+                  sh_addr <= burst_addr;
+                burst_addr <= burst_addr + 9'd1;
               end else begin
-                rd_shift <= 32'h00000000;
+                io_shift <= 32'h00000000;
               end
             end
           end else begin
             out_bit_cnt <= out_bit_cnt - 1'b1;
-            rd_shift <= {rd_shift[30:0], 1'b0};
+            io_shift <= {io_shift[30:0], 1'b0};
           end
         end
       end
 
       // Capture a completed prefetch into the one-word buffer. The next
-      // prefetch is issued only when that buffer is consumed into rd_shift,
+      // prefetch is issued only when that buffer is consumed into io_shift,
       // which keeps the pipeline exactly one word ahead even though SPI bit
       // time is much longer than macro latency.
       if (read_rvalid) begin

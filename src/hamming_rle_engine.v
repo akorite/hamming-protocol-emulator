@@ -46,18 +46,18 @@ module hamming_rle_engine (
     output reg         mem_req,
     output reg         mem_we,
     output reg  [8:0]  mem_addr,
-    output reg  [31:0] mem_wdata,
+    output wire [31:0] mem_wdata,
     input  wire        mem_grant,
     input  wire        mem_rvalid,
     input  wire [31:0] mem_rdata,
 
-    output reg  [15:0] replay_data,
+    output wire [15:0] replay_data,
     output reg         replay_active,
 
     output reg         overflow,
     output reg         underflow,
     output wire        capturing,
-    output reg  [8:0]  wr_ptr
+    output wire [8:0]  wr_ptr
 );
 
   localparam MODE_OFF     = 2'd0;
@@ -118,7 +118,7 @@ module hamming_rle_engine (
   // ------------------------------------------------------------------
   // Capture edge detection.
   // ------------------------------------------------------------------
-  reg [15:0] prev_probe;
+  reg [15:0] prev_probe;   // shared with replay_data (exclusive modes)
   reg [15:0] delta_cnt;
   reg        cap_active;
   reg        trig_started;
@@ -146,15 +146,16 @@ module hamming_rle_engine (
   localparam RP_RUN  = 2'd1;
   localparam RP_DONE = 2'd2;
   reg [1:0]  rp_state;
-  reg [8:0]  rp_rd_ptr;      // next read address inside the ring
   reg [9:0]  rp_issued;      // reads issued this replay pass
-  reg [9:0]  rp_consumed;    // records popped by the sequencer
-  reg [15:0] rp_wait;
   reg        rp_rec_valid;
   reg        rd_inflight;
+  wire [15:0] rp_wait = delta_cnt;   // shared mode-exclusive register
 
   wire [9:0] ring_size = {1'b0, rle_mask} + 10'd1;
   wire       rp_all_issued   = (rp_issued >= ring_size);
+  wire [9:0] rp_inflight_ext = {9'b0, rd_inflight};
+  wire [9:0] rp_pending = {6'b0, fifo_cnt} + rp_inflight_ext + {9'b0, rp_rec_valid};
+  wire [9:0] rp_consumed = rp_issued - rp_pending;
   wire       rp_all_consumed = (rp_consumed >= ring_size);
   // Credit: never issue a read whose data could arrive to a full FIFO.
   wire [4:0] fifo_space = 5'd8 - {1'b0, fifo_cnt};
@@ -162,6 +163,9 @@ module hamming_rle_engine (
                             (fifo_space >= 5'd2);
 
   assign capturing = cap_active;
+  assign replay_data = prev_probe;
+  assign mem_wdata = fifo[fifo_rd];
+  assign wr_ptr = ring_wptr;
 
   // ------------------------- push/pop arbitration ---------------------
   wire rp_rec_done = (rp_state == RP_RUN) && rp_rec_valid &&
@@ -198,20 +202,14 @@ module hamming_rle_engine (
       trig_started  <= 1'b0;
       trig_d        <= 1'b0;
       ring_wptr     <= 9'h0;
-      wr_ptr        <= 9'h0;
       mem_req       <= 1'b0;
       mem_we        <= 1'b0;
       mem_addr      <= 9'h0;
-      mem_wdata     <= 32'h0;
       overflow      <= 1'b0;
       underflow     <= 1'b0;
-      replay_data   <= 16'h0;
       replay_active <= 1'b0;
       rp_state      <= RP_IDLE;
-      rp_rd_ptr     <= 9'h0;
       rp_issued     <= 10'd0;
-      rp_consumed   <= 10'd0;
-      rp_wait       <= 16'h0;
       rp_rec_valid  <= 1'b0;
       rd_inflight   <= 1'b0;
     end else begin
@@ -233,8 +231,7 @@ module hamming_rle_engine (
         rp_state      <= RP_IDLE;
         rp_rec_valid  <= 1'b0;
         rp_issued     <= 10'd0;
-        rp_consumed   <= 10'd0;
-      end
+        end
 
       // ----------------------------------------------- CAPTURE ------
       else if (mode == MODE_CAPTURE) begin
@@ -243,7 +240,6 @@ module hamming_rle_engine (
           cap_active   <= 1'b1;
           trig_started <= ~trig_start_en;
           ring_wptr    <= rle_base;
-          wr_ptr       <= rle_base;
           prev_probe   <= probe;
           delta_cnt    <= 16'h0;
           mem_req      <= 1'b0;
@@ -269,12 +265,10 @@ module hamming_rle_engine (
           if (mem_req && mem_accept) begin
             mem_req   <= 1'b0;
             ring_wptr <= ring_wnext;
-            wr_ptr    <= ring_wnext;
           end else if (!mem_req && !fifo_empty) begin
             mem_req   <= 1'b1;
             mem_we    <= 1'b1;
             mem_addr  <= ring_wptr;
-            mem_wdata <= fifo[fifo_rd];
           end
         end
       end
@@ -284,12 +278,9 @@ module hamming_rle_engine (
         case (rp_state)
           RP_IDLE: begin
             rp_state      <= RP_RUN;
-            rp_rd_ptr     <= rle_base;
             rp_issued     <= 10'd0;
-            rp_consumed   <= 10'd0;
-            rp_rec_valid  <= 1'b0;
-            rp_wait       <= 16'h0;
-            rd_inflight   <= 1'b0;
+                  rp_rec_valid  <= 1'b0;
+                  rd_inflight   <= 1'b0;
             mem_req       <= 1'b0;
             replay_active <= 1'b0;
           end
@@ -302,11 +293,8 @@ module hamming_rle_engine (
             end else if (!mem_req && rp_can_issue) begin
               mem_req   <= 1'b1;
               mem_we    <= 1'b0;
-              mem_addr  <= rp_rd_ptr;
+              mem_addr  <= rle_base | (rp_issued[8:0] & rle_mask);
               rp_issued <= rp_issued + 10'd1;
-              rp_rd_ptr <= ((rp_rd_ptr & rle_mask) == rle_mask) ?
-                           rle_base :
-                           (rle_base | ((rp_rd_ptr + 9'd1) & rle_mask));
             end
             if (mem_rvalid)
               rd_inflight <= 1'b0;
@@ -317,7 +305,7 @@ module hamming_rle_engine (
                 // Prefetch satisfied: outputs go live with the first
                 // record pickup.
                 replay_active <= 1'b1;
-                rp_wait       <= fifo[fifo_rd][31:16];
+                delta_cnt     <= fifo[fifo_rd][31:16];
                 rp_rec_valid  <= 1'b1;
               end else if (rp_all_consumed ||
                            (rp_all_issued && !rd_inflight && fifo_empty)) begin
@@ -332,10 +320,9 @@ module hamming_rle_engine (
               end
             end else begin
               if (rp_wait != 16'd0) begin
-                rp_wait <= rp_wait - 16'd1;
+                delta_cnt <= rp_wait - 16'd1;
               end else begin
-                replay_data  <= fifo[fifo_rd][15:0];
-                rp_consumed  <= rp_consumed + 10'd1;
+                prev_probe   <= fifo[fifo_rd][15:0];
                 rp_rec_valid <= 1'b0;
                 if (rp_consumed + 10'd1 >= ring_size) begin
                   rp_state      <= RP_DONE;

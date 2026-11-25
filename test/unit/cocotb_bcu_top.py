@@ -112,6 +112,94 @@ async def test_nrz_loopback_msb(dut):
 
 
 @cocotb.test()
+async def test_extclk_lsb_nonpalindromic(dut):
+    """LSB-first reassembly with reversal-visible data: 0x17 reversed is
+    0xE8, so a missing/wrong completion reversal must fail. Driven through
+    extclk so clock-recovery physics cannot mask the ordering logic."""
+    mode = isa.pack_bcu_mode(codec="nrz_extclk", stuff="off")
+    await setup(dut, mode=mode, bit_len=8)
+    dut.ctrl.value = 0x2  # rx_arm
+    await RisingEdge(dut.clk)
+    value = 0x17
+    for i in range(8):
+        await extclk_bit(dut, (value >> i) & 1)  # LSB-first wire order
+    await cycles(dut, 2)
+    assert dut.stat.value[5] == 1, "rx_full not set after 8 bits"
+    got = dut.rx_data.value.integer & 0xFF
+    assert got == value, f"rx {got:#04x} != {value:#04x}"
+
+
+@cocotb.test()
+async def test_extclk_msb_nonpalindromic(dut):
+    """MSB-first reassembly: wire bits arrive bit7 first and must land in
+    transfer order."""
+    mode = isa.pack_bcu_mode(codec="nrz_extclk", stuff="off")
+    await setup(dut, mode=mode, bit_len=8, msb=True)
+    dut.ctrl.value = 0x2  # rx_arm
+    await RisingEdge(dut.clk)
+    value = 0x17
+    for i in range(7, -1, -1):
+        await extclk_bit(dut, (value >> i) & 1)  # MSB-first wire order
+    await cycles(dut, 2)
+    assert dut.stat.value[5] == 1, "rx_full not set after 8 bits"
+    got = dut.rx_data.value.integer & 0xFF
+    assert got == value, f"rx {got:#04x} != {value:#04x}"
+
+
+@cocotb.test()
+async def test_extclk_lsb_partial_len(dut):
+    """LSB-first 5-bit transfer: reversal aligns within the low n bits and
+    zero-extends above them (0x0D reversed in 5 bits is 0x16)."""
+    mode = isa.pack_bcu_mode(codec="nrz_extclk", stuff="off")
+    await setup(dut, mode=mode, bit_len=5)
+    dut.ctrl.value = 0x2  # rx_arm
+    await RisingEdge(dut.clk)
+    value = 0x0D
+    for i in range(5):
+        await extclk_bit(dut, (value >> i) & 1)
+    await cycles(dut, 2)
+    assert dut.stat.value[5] == 1, "rx_full not set after 5 bits"
+    got = dut.rx_data.value.integer & 0xFFFF
+    assert got == 0x0D, f"rx {got:#06x} != 0x0D"
+
+
+@cocotb.test()
+async def test_extclk_lsb_16bit(dut):
+    """LSB-first 16-bit transfer, non-palindromic; also verifies no
+    zero-fill when n == 16."""
+    mode = isa.pack_bcu_mode(codec="nrz_extclk", stuff="off")
+    await setup(dut, mode=mode, bit_len=16)
+    dut.ctrl.value = 0x2  # rx_arm
+    await RisingEdge(dut.clk)
+    value = 0xBEEF
+    for i in range(16):
+        await extclk_bit(dut, (value >> i) & 1)
+    await cycles(dut, 2)
+    assert dut.stat.value[5] == 1, "rx_full not set after 16 bits"
+    got = dut.rx_data.value.integer & 0xFFFF
+    assert got == 0xBEEF, f"rx {got:#06x} != 0xBEEF"
+
+
+@cocotb.test()
+async def test_extclk_frame_continuity(dut):
+    """Back-to-back LSB frames: stale bits above the transfer length must
+    not corrupt subsequent zero-extended reassembly."""
+    mode = isa.pack_bcu_mode(codec="nrz_extclk", stuff="off")
+    await setup(dut, mode=mode, bit_len=8)
+    dut.ctrl.value = 0x2  # rx_arm
+    await RisingEdge(dut.clk)
+    for value in (0xFF, 0x03, 0x17):
+        for i in range(8):
+            await extclk_bit(dut, (value >> i) & 1)
+        await cycles(dut, 2)
+        got = dut.rx_data.value.integer & 0xFF
+        assert got == value, f"rx {got:#04x} != {value:#04x}"
+        dut.rx_pop.value = 1
+        await RisingEdge(dut.clk)
+        dut.rx_pop.value = 0
+
+
+@cocotb.test()
 async def test_nrzi_loopback_diff(dut):
     """NRZI differential loopback recovers the transmitted byte."""
     mode = isa.pack_bcu_mode(codec="nrzi", stuff="off", rx_diff=1)
