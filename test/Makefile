@@ -7,7 +7,7 @@ FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = project.v sram_bb.v hamming_sram_2kb.v
+PROJECT_SOURCES = project.v sram_bb.v hamming_sram_2kb.v hamming_host_spi.v hamming_csr.v hamming_sram_arb.v
 
 # Propagate GATES to the simulation environment (test.py reads it).
 export GATES

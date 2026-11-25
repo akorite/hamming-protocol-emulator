@@ -36,6 +36,41 @@ def yosys_bin():
     return str(OSS_CAD_BIN / exe) if exe.endswith(".exe") else exe
 
 
+def run_yosys(script):
+    result = subprocess.run(
+        [yosys_bin(), "-Q", "-T", "-p", script],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    out = result.stdout + result.stderr
+    sys.stdout.write(out)
+    if result.returncode != 0:
+        sys.exit(f"check_synth: yosys failed ({result.returncode})")
+    return out
+
+
+def lint_yosys_output(out, label):
+    probs = max((int(n) for n in re.findall(r"found and reported (\d+) problems", out, re.I)), default=0)
+    if probs:
+        sys.exit(f"check_synth: {label}: yosys `check` reported {probs} problems")
+    width_warnings = re.findall(r"^Warning:.*width.*$", out, re.I | re.M)
+    if width_warnings:
+        sys.exit(f"check_synth: {label}: width warnings: {width_warnings[0]}")
+
+    # `synth` prints a statistics block and the explicit trailing `stat`
+    # prints it again. Restrict cell counts to the requested top module's
+    # local block so duplicate summary/hierarchy tables are not counted.
+    stat_blocks = re.findall(
+        rf"^=== {re.escape(label)} ===\n(.*?)(?=^=== |\Z)", out, re.S | re.M
+    )
+    stat_text = stat_blocks[-1] if stat_blocks else out
+    latches = sum(int(n) for n in re.findall(r"^\s+(\d+)\s+\$_DLATCH\w*\s*$", stat_text, re.M))
+    if latches:
+        sys.exit(f"check_synth: {label}: {latches} inferred latches")
+    return sum(int(n) for n in re.findall(r"^\s+(\d+)\s+\$_S?DFF\w*\s*$", stat_text, re.M))
+
+
 def project_sources():
     files = []
     in_list = False
@@ -67,26 +102,32 @@ def main():
         f"{read_cmd}; hierarchy -top tt_um_akorite_hamming; proc; "
         "synth -top tt_um_akorite_hamming; check; stat -top tt_um_akorite_hamming"
     )
-    result = subprocess.run(
-        [yosys_bin(), "-Q", "-T", "-p", script],
-        capture_output=True,
-        text=True,
-        cwd=ROOT,
-    )
-    out = result.stdout + result.stderr
-    sys.stdout.write(out)
-    if result.returncode != 0:
-        sys.exit(f"check_synth: yosys failed ({result.returncode})")
-    probs = max((int(n) for n in re.findall(r"found and reported (\d+) problems", out, re.I)), default=0)
-    if probs:
-        sys.exit(f"check_synth: yosys `check` reported {probs} problems")
-    latches = sum(int(n) for n in re.findall(r"^\s+(\d+)\s+\$_DLATCH\w*\s*$", out, re.M))
-    if latches:
-        sys.exit(f"check_synth: {latches} inferred latches")
-    ffs = sum(int(n) for n in re.findall(r"^\s+(\d+)\s+\$_S?DFF\w*\s*$", out, re.M))
+    out = run_yosys(script)
+    ffs = lint_yosys_output(out, "tt_um_akorite_hamming")
     print(f"check_synth: {ffs} flip-flops (budget {FF_BUDGET}, ASIC only)")
     if not args.fpga and ffs > FF_BUDGET:
         sys.exit(f"check_synth: {ffs} FFs exceeds {FF_BUDGET} budget")
+
+    # Units not yet instantiated by the integration top still receive a real
+    # elaboration/synthesis lint here. Merely reading them into the top-level
+    # script would let hierarchy pruning hide latches and width mismatches.
+    unit_modules = [
+        ("hamming_host_spi", ["hamming_host_spi.v"]),
+        ("hamming_csr", ["hamming_csr.v"]),
+        ("hamming_sram_arb", ["sram_bb.v", "hamming_sram_2kb.v", "hamming_sram_arb.v"]),
+    ]
+    for unit_top, files in unit_modules:
+        if not all((SRC / f).exists() for f in files):
+            continue
+        unit_read = "; ".join(
+            f"read_verilog {' '.join(defines)} -I{SRC} {SRC / f}" for f in files
+        )
+        unit_script = (
+            f"{unit_read}; hierarchy -top {unit_top}; proc; "
+            f"synth -top {unit_top}; check; stat -top {unit_top}"
+        )
+        unit_ffs = lint_yosys_output(run_yosys(unit_script), unit_top)
+        print(f"check_synth: {unit_top}: {unit_ffs} flip-flops")
 
 
 if __name__ == "__main__":
