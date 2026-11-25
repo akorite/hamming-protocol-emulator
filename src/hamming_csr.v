@@ -358,6 +358,7 @@ module hamming_csr (
   integer swc;
   reg [7:0] swaddr;
   always @* begin
+    swaddr = 8'h0;
     crc_lo_we = 4'h0;
     crc_hi_we = 4'h0;
     crc_seed_flat = 64'h0;
