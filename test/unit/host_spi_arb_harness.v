@@ -122,6 +122,7 @@ module host_spi_arb_harness (
   );
 
   hamming_csr i_csr (
+    .bcu_crc_live_flat(128'h0),
       .clk                 (clk),
       .rst_n               (rst_n),
       .host_we             (host_csr_we),

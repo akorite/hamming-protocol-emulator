@@ -516,8 +516,6 @@ class HammingISS:
                 return self.core_oe
             if off == isa.CORE_CSR["BCU_STAT_SNAP"]:
                 return self.bcu.stat & 0xFFFF
-            if off == isa.CORE_CSR["BCU_TX_DATA"]:
-                return self.bcu.tx_shadow
             if off == isa.CORE_CSR["BCU_RX_DATA"]:
                 return self.bcu.rx_shadow
             if off == isa.CORE_CSR["BCU_CRC_STATE_LO"]:
@@ -545,15 +543,14 @@ class HammingISS:
                 self.bcu.crc_state = (self.bcu.crc_state & 0xFFFF0000) | val
             elif off == isa.CORE_CSR["BCU_CRC_STATE_HI"]:
                 self.bcu.crc_state = (self.bcu.crc_state & 0xFFFF) | (val << 16)
-            elif off == isa.CORE_CSR["BCU_TX_DATA"]:
-                self.bcu.tx_shadow = val
             elif off == isa.CORE_CSR["BCU_RX_DATA"]:
                 self.bcu.rx_shadow = val
             elif off == isa.CORE_CSR["BCU_CRC_POLY_LO"]:
                 self.bcu.crc_poly = (self.bcu.crc_poly & 0xFFFF0000) | val
             elif off == isa.CORE_CSR["BCU_CRC_POLY_HI"]:
                 self.bcu.crc_poly = (self.bcu.crc_poly & 0xFFFF) | (val << 16)
-            self.csr[addr] = val
+            if off != isa.CORE_CSR["BCU_TX_DATA"]:
+                self.csr[addr] = val
         # Writes outside the owned bank (other banks, LUT/router/global
         # config, read-only status) are dropped per the KTD11 ownership rule.
 

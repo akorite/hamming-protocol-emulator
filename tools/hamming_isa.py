@@ -151,6 +151,8 @@ CSR = {
     "RLE_STATUS": 0x09,    # bit0 overflow, bit1 underflow, bit2 capturing
     "PIN_FILT_EN": 0x0A,
     "OPEN_DRAIN_EN": 0x0B,
+    "RLE_CTRL": 0x0C,
+    "RLE_PROBE_MASK": 0x0D,
     # 0x20-0x25: output pin router, 23 x 4b channel selectors
     "PIN_ROUTER0": 0x20,
     "PIN_ROUTER1": 0x21,
@@ -197,6 +199,39 @@ BCU_STAT_BITS = {
 
 # CTRL_RUN bits.
 CTRL_RUN_CORES = 0x0F     # [3:0] start mask for cores 0..3
+
+# RLE_CTRL[15:0] bit fields:
+#   [1:0] mode         0=OFF, 1=CAPTURE, 2=REPLAY (mutually exclusive)
+#   [2]  trig_start_en capture starts on the selected LUT trigger edge
+#   [3]  trig_stop_en  capture stops on the selected LUT trigger edge
+#   [6:4] trig_sel     tier-2 LUT (matrix LUTs 8..15) index 0..7 used as
+#                      the trigger source
+#   [7]  reserved (write zero)
+#   [8]  sticky_clear  write-1 pulse clearing overflow/underflow stickies
+#   [15:9] reserved (write zero)
+# The fixed probe vector is {uio_in[7:0], ui_in[7:0]} (16 bits);
+# RLE_PROBE_MASK arms edge detection per probe bit. Replay drives a
+# 16-bit replay_data vector into the output pin router, one bit per
+# router-selectable replay channel.
+RLE_MODE = {"off": 0, "capture": 1, "replay": 2}
+RLE_MODE_NAMES = {v: k for k, v in RLE_MODE.items()}
+
+# RLE record encoding (32-bit SRAM words): {delta[15:0], probe[15:0]}.
+# delta counts capture-clock cycles since the previous record. An edge
+# exactly at delta == 16'hFFFF emits {16'hFFFF, new_probe}; when no edge
+# arrives for 16'hFFFF cycles the engine emits the heartbeat record
+# {16'hFFFF, prev_probe} and restarts the delta counter, so idle gaps of
+# any length are represented losslessly.
+RLE_DELTA_SAT = 0xFFFF
+
+
+def pack_rle_ctrl(mode="off", trig_start_en=0, trig_stop_en=0, trig_sel=0,
+                  sticky_clear=0):
+    if isinstance(mode, str):
+        mode = RLE_MODE[mode]
+    return ((mode & 0x3) | ((trig_start_en & 1) << 2) |
+            ((trig_stop_en & 1) << 3) | ((trig_sel & 0x7) << 4) |
+            ((sticky_clear & 1) << 8))
 
 # READ_TIMER selectors.
 READ_TIMER_LO = 0        # rd <= timer[15:0]
@@ -1038,6 +1073,8 @@ def emit_docs():
         "RLE_WR_PTR": "RLE ring write pointer",
         "RLE_STATUS": "bit0 overflow, bit1 underflow, bit2 capturing",
         "PIN_FILT_EN": "per-pin 4-tap glitch filter enable",
+"RLE_CTRL": "mode, trig en/sel, sticky clear",
+"RLE_PROBE_MASK": "edge-detect arm mask for probe[15:0]",
         "OPEN_DRAIN_EN": "post-router open-drain clamp",
         "PIN_ROUTER0": "output pin router channels 3:0",
         "PIN_ROUTER1": "output pin router channels 7:4",

@@ -66,10 +66,11 @@ async def reset_dut(dut):
     dut.pin_router_flat.value = 0
     dut.open_drain_en.value = 0
     dut.ev_flags.value = 0
-    dut.replay_bit.value = 0
+    dut.replay_data.value = 0
     dut.replay_active.value = 0
     dut.host_cs_active.value = 0
     dut.core_out_flat.value = 0
+    dut.core_oe_flat.value = 0
     dut.bcu_tx_p.value = 0
     dut.bcu_tx_n.value = 0
     dut.bcu_tx_oe.value = 0
@@ -226,7 +227,7 @@ async def test_router_single_owner_and_replay_gate(dut):
     assert (u(dut.uio_out) & ~0b100) == 0, f"unexpected uio_out {u(dut.uio_out):08b}"
 
     # Replay: gated to 0 while replay_active is low.
-    dut.replay_bit.value = 1
+    dut.replay_data.value = 1
     await ClockCycles(dut.clk, 3)
     await Timer(1, unit="ns")
     assert u(dut.uio_out) & 1 == 0, "replay reached pin while replay inactive"

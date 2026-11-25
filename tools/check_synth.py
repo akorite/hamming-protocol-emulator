@@ -103,7 +103,7 @@ def main():
     )
     script = (
         f"{read_cmd}; hierarchy -top tt_um_akorite_hamming; proc; "
-        "synth -top tt_um_akorite_hamming; check; stat -top tt_um_akorite_hamming"
+        "synth -top tt_um_akorite_hamming; check; flatten; stat -top tt_um_akorite_hamming"
     )
     out = run_yosys(script)
     ffs, cells = lint_yosys_output(out, "tt_um_akorite_hamming")
@@ -134,7 +134,7 @@ def main():
         )
         unit_script = (
             f"{unit_read}; hierarchy -top {unit_top}; proc; "
-            f"synth -top {unit_top}; check; stat -top {unit_top}"
+            f"synth -top {unit_top}; check; flatten; stat -top {unit_top}"
         )
         unit_ffs, unit_cells = lint_yosys_output(run_yosys(unit_script), unit_top)
         unit_ff_counts[unit_top] = (unit_ffs, unit_cells)
@@ -146,10 +146,11 @@ def main():
     # target is reported visibility-only for now; correctness and lint remain
     # hard gates while U5/U6 integration determines the final area budget.
     if "hamming_core" in unit_ff_counts:
+        # The flattened core count is hierarchical and already includes its
+        # loop cache; the standalone icache line is reported for visibility.
         core_ffs, core_cells = unit_ff_counts["hamming_core"]
-        cache_ffs, cache_cells = unit_ff_counts.get("hamming_icache", (0, 0))
-        core_cache_ffs = core_ffs + cache_ffs
-        core_cache_cells = core_cells + cache_cells
+        core_cache_ffs = core_ffs
+        core_cache_cells = core_cells
         print(
             f"check_synth: core+cache total: {core_cache_ffs} flip-flops "
             f"(budget 520), {core_cache_cells} cells (target < 2200)"

@@ -97,6 +97,8 @@
 `define HAM_CSR_RLE_STATUS           8'h09
 `define HAM_CSR_PIN_FILT_EN          8'h0A
 `define HAM_CSR_OPEN_DRAIN_EN        8'h0B
+`define HAM_CSR_RLE_CTRL             8'h0C
+`define HAM_CSR_RLE_PROBE_MASK       8'h0D
 `define HAM_CSR_PIN_ROUTER0          8'h20
 `define HAM_CSR_PIN_ROUTER1          8'h21
 `define HAM_CSR_PIN_ROUTER2          8'h22

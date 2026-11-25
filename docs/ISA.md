@@ -157,6 +157,8 @@ writes outside the owned set are dropped.
 | 0x09 | RLE_STATUS | bit0 overflow, bit1 underflow, bit2 capturing |
 | 0x0A | PIN_FILT_EN | per-pin 4-tap glitch filter enable |
 | 0x0B | OPEN_DRAIN_EN | post-router open-drain clamp |
+| 0x0C | RLE_CTRL | mode, trig en/sel, sticky clear |
+| 0x0D | RLE_PROBE_MASK | edge-detect arm mask for probe[15:0] |
 | 0x20 | PIN_ROUTER0 | output pin router channels 3:0 |
 | 0x21 | PIN_ROUTER1 | output pin router channels 7:4 |
 | 0x22 | PIN_ROUTER2 | output pin router channels 11:8 |

@@ -57,6 +57,9 @@ module hamming_bcu (
     input  wire [31:0] cfg_crc_poly,
     input  wire [31:0] cfg_crc_state,
     input  wire        crc_seed_we,  // synchronous seed-load strobe
+    input  wire        crc_lo_we,    // CSR half-write strobes (BCU_CRC_STATE_*)
+    input  wire        crc_hi_we,
+    input  wire [15:0] crc_seed16,
     input  wire [15:0] cfg_bit_len,
     input  wire [15:0] cfg_pat_match,
     input  wire [15:0] cfg_pat_len,
@@ -119,7 +122,10 @@ module hamming_bcu (
         .cfg_poly(cfg_crc_poly),
         .load_en(crc_seed_we | ctl_crc_reset),
         .load_state(crc_seed_we ? cfg_crc_state :
-                    (crc_init1 ? 32'hFFFFFFFF : 32'h00000000)),
+                    ((crc_lo_we | crc_hi_we) ? {16'h0000, crc_seed16} :
+                     (crc_init1 ? 32'hFFFFFFFF : 32'h00000000))),
+        .lo_we(crc_lo_we),
+        .hi_we(crc_hi_we),
         .step_en(crc_step),
         .step_bit(crc_bit),
         .state(crc_raw),

@@ -34,6 +34,9 @@ async def setup(dut, mode=0, bit_len=8, msb=False, period=CLKS_PER_BIT,
     dut.cfg_crc_poly.value = poly
     dut.cfg_crc_state.value = 0
     dut.crc_seed_we.value = 0
+    dut.crc_lo_we.value = 0
+    dut.crc_hi_we.value = 0
+    dut.crc_seed16.value = 0
     dut.cfg_bit_len.value = pack_bit_len(bit_len, msb)
     dut.cfg_pat_match.value = pat
     dut.cfg_pat_len.value = pat_len

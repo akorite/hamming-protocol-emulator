@@ -13,10 +13,16 @@
 // combinational loop can exist regardless of the CSR configuration.
 //
 // Router channel order:  0..7 uio_out data, 8..15 uio_oe, 16..22 uo_out.
-// Router sources: 0 const0, 1 const1, 2 replay, 3..10 LUT8..15,
-// 11 paired core out[0], 12/13/14 paired BCU tx_p/tx_n/tx_oe, 15 const0.
-// The core/BCU pairing uses channel index bits [1:0] so every core and BCU
-// has a routable path in each pin group.
+// Router sources: 0 const0, 1 const1, 2 replay_data[ch[3:0]], 3..10
+// LUT8..15, 11 paired core signal, 12/13/14 paired BCU tx_p/tx_n/tx_oe,
+// 15 const0.  Core/BCU pairing uses channel index bits [1:0].  The source-11
+// core signal depends on the channel group so every core can drive four
+// independent output bits and two independent oe bits:
+//   uio data ch 0..7    core out bit ch/4  (uio pins k and k+4 = bits 0/1)
+//   uio oe   ch 8..15   core oe  bit (ch-8)/4 (mirrors the data position)
+//   uo_out   ch 16..22  core out bit 2 + (ch >= 20)
+// so one core can bit-bang I2C (two open-drain pins, distinct oe) and
+// three-wire SPI (SCLK/MOSI on uio, CS_N on uo_out bit 2).
 module hamming_lut_matrix (
     input  wire        clk,
     input  wire        rst_n,
@@ -32,10 +38,11 @@ module hamming_lut_matrix (
     input  wire [7:0]  open_drain_en,
 
     input  wire [7:0]  ev_flags,
-    input  wire        replay_bit,
+    input  wire [15:0] replay_data,   // per-channel replay vector
     input  wire        replay_active,
     input  wire        host_cs_active,
     input  wire [15:0] core_out_flat,   // 4 cores x out[3:0]
+    input  wire [15:0] core_oe_flat,    // 4 cores x oe[3:0]
     input  wire [3:0]  bcu_tx_p,
     input  wire [3:0]  bcu_tx_n,
     input  wire [3:0]  bcu_tx_oe,
@@ -95,7 +102,7 @@ module hamming_lut_matrix (
     end
   endgenerate
 
-  wire replay_gated = replay_bit & replay_active;
+  wire replay_gated = replay_data[0] & replay_active;
 
   // ------------------------------------------------------------------------
   // Tier source buses.
@@ -168,16 +175,39 @@ module hamming_lut_matrix (
 
   integer ch;
   reg [3:0] ch_sel;
+  reg [1:0] cbit;
+  reg       use_oe;
+  reg       core_sig;
+  reg [15:0] ch_src;
   reg [22:0] ch_out;
   always @* begin
     for (ch = 0; ch < 23; ch = ch + 1) begin
       ch_sel = pin_router_flat[ch*4 +: 4];
       case (ch[1:0])
-        2'd0:    ch_out[ch] = src_bus0[ch_sel];
-        2'd1:    ch_out[ch] = src_bus1[ch_sel];
-        2'd2:    ch_out[ch] = src_bus2[ch_sel];
-        default: ch_out[ch] = src_bus3[ch_sel];
+        2'd0:    ch_src = src_bus0;
+        2'd1:    ch_src = src_bus1;
+        2'd2:    ch_src = src_bus2;
+        default: ch_src = src_bus3;
       endcase
+      // Source 2: per-channel replay bit (index wraps mod 16).
+      ch_src[2] = replay_data[ch[3:0]] & replay_active;
+      // Source 11: channel-group-dependent core bit pairing.
+      if (ch < 8) begin
+        use_oe = 1'b0;
+        cbit = {1'b0, ch[2]};
+      end else if (ch < 16) begin
+        use_oe = 1'b1;
+        cbit = {1'b0, ch[2]};
+      end else begin
+        use_oe = 1'b0;
+        cbit = 2'd2 + ((ch >= 20) ? 2'd1 : 2'd0);
+      end
+      if (use_oe)
+        core_sig = core_oe_flat[ch[1:0]*4 + cbit];
+      else
+        core_sig = core_out_flat[ch[1:0]*4 + cbit];
+      ch_src[11] = core_sig;
+      ch_out[ch] = ch_src[ch_sel];
     end
   end
 

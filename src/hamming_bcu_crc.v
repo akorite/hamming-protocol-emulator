@@ -22,6 +22,13 @@ module hamming_bcu_crc (
     input  wire        load_en,       // synchronous seed load
     input  wire [31:0] load_state,
 
+    // Half-word seed writes from the CSR bank (the CSR holds no duplicate
+    // state; this register is the single storage).  A write to
+    // BCU_CRC_STATE_LO/HI pulses the matching enable with the new half
+    // presented on load_state.  Full load_en takes priority.
+    input  wire        lo_we,
+    input  wire        hi_we,
+
     input  wire        step_en,
     input  wire        step_bit,
 
@@ -46,11 +53,16 @@ module hamming_bcu_crc (
   wire [31:0] step_lsb = (({1'b0, state_r[31:1]}) & mask) ^
                          (fb_lsb ? (cfg_poly & mask) : 32'h00000000);
 
+  wire [31:0] half_lo  = lo_we ? {state_r[31:16], load_state[15:0]} : state_r;
+  wire [31:0] half_next = hi_we ? {load_state[15:0], half_lo[15:0]} : half_lo;
+
   always @(posedge clk) begin
     if (!rst_n) begin
       state_r <= 32'h00000000;
     end else if (load_en) begin
       state_r <= load_state & mask;
+    end else if (lo_we | hi_we) begin
+      state_r <= half_next & mask;
     end else if (step_en) begin
       state_r <= cfg_msb ? step_msb : step_lsb;
     end

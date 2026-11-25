@@ -43,7 +43,12 @@ module hamming_host_spi (
     output reg         csr_we,
     output reg  [7:0]  csr_addr,
     output reg  [15:0] csr_wdata,
-    input  wire [15:0] csr_rdata
+    input  wire [15:0] csr_rdata,
+
+    // Integration status taps: synchronized chip-enable and SPI frame
+    // activity for project.v output clamping / run gating.
+    output wire        chip_ena,
+    output wire        spi_active
 );
 
   localparam ST_IDLE      = 3'd0;
@@ -69,6 +74,8 @@ module hamming_host_spi (
   reg was_active;
 
   wire sync_active = ena_sync & ~cs_sync;
+  assign chip_ena = ena_sync;
+  assign spi_active = sync_active;
   wire active = sync_active & was_active;
   wire start = sync_active & ~was_active;
   wire done = ~sync_active & was_active;

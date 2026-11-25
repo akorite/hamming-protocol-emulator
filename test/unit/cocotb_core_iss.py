@@ -291,7 +291,7 @@ async def test_core_csr_event_and_ownership_differential(dut):
     CSR bank and the ISS ownership model; writes outside the owned bank drop."""
     evset = isa.CSR["EV_SET"]
     evclr = isa.CSR["EV_CLR"]
-    txdata = isa.CSR_CORE_BANK + isa.CORE_CSR["BCU_TX_DATA"]
+    txdata = isa.CSR_CORE_BANK + isa.CORE_CSR["BCU_PAT_MATCH"]
     lut0 = isa.CSR_LUT_TT_BASE
     program = [
         isa.enc_ldi8(0, 0, 0x5A),

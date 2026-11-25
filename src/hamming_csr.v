@@ -54,7 +54,14 @@ module hamming_csr (
     output wire [63:0]  bcu_pat_match_flat,
     output wire [63:0]  bcu_pat_len_flat,
     output wire [63:0]  bcu_dpll_cfg_flat,
-    output wire [63:0]  bcu_tx_data_flat
+    output wire [63:0]  bcu_tx_data_flat,
+    input  wire [127:0] bcu_crc_live_flat,
+    output reg  [3:0]  crc_lo_we,
+    output reg  [3:0]  crc_hi_we,
+    output reg  [63:0] crc_seed_flat,
+    output wire [15:0] rle_ctrl,
+    output wire [15:0] rle_probe_mask,
+    output reg         rle_sticky_clr
 );
 
   localparam CSR_CTRL_RUN      = `HAM_CSR_CTRL_RUN;
@@ -64,6 +71,8 @@ module hamming_csr (
   localparam CSR_TIMER_LO      = `HAM_CSR_TIMER_LO;
   localparam CSR_TIMER_HI      = `HAM_CSR_TIMER_HI;
   localparam CSR_RLE_BASE      = `HAM_CSR_RLE_BASE;
+  localparam CSR_RLE_CTRL      = `HAM_CSR_RLE_CTRL;
+  localparam CSR_RLE_PROBE_MASK = `HAM_CSR_RLE_PROBE_MASK;
   localparam CSR_RLE_MASK      = `HAM_CSR_RLE_MASK;
   localparam CSR_RLE_WR_PTR    = `HAM_CSR_RLE_WR_PTR;
   localparam CSR_RLE_STATUS    = `HAM_CSR_RLE_STATUS;
@@ -78,6 +87,8 @@ module hamming_csr (
   reg [3:0]  ctrl_run_r;
   reg [7:0]  ev_flags_r;
   reg [19:0] timer_r;
+  reg [15:0] rle_ctrl_r;
+  reg [15:0] rle_probe_mask_r;
   reg [15:0] rle_base_r;
   reg [15:0] rle_mask_r;
   reg [7:0]  pin_filt_en_r;
@@ -89,12 +100,10 @@ module hamming_csr (
 
   reg [15:0] bcu_mode_r      [0:3];
   reg [31:0] bcu_crc_poly_r  [0:3];
-  reg [31:0] bcu_crc_state_r [0:3];
   reg [15:0] bcu_bit_len_r   [0:3];
   reg [15:0] bcu_pat_match_r [0:3];
   reg [15:0] bcu_pat_len_r   [0:3];
   reg [15:0] bcu_dpll_cfg_r  [0:3];
-  reg [15:0] bcu_tx_data_r   [0:3];
 
   assign ctrl_run     = ctrl_run_r;
   assign ev_flags     = ev_flags_r;
@@ -117,12 +126,12 @@ module hamming_csr (
     for (go = 0; go < 4; go = go + 1) begin : gen_core_cfg_out
       assign bcu_mode_flat[go*16 +: 16]       = bcu_mode_r[go];
       assign bcu_crc_poly_flat[go*32 +: 32]   = bcu_crc_poly_r[go];
-      assign bcu_crc_state_flat[go*32 +: 32]  = bcu_crc_state_r[go];
+      assign bcu_crc_state_flat[go*32 +: 32] = bcu_crc_live_flat[go*32 +: 32];
       assign bcu_bit_len_flat[go*16 +: 16]    = bcu_bit_len_r[go];
       assign bcu_pat_match_flat[go*16 +: 16]  = bcu_pat_match_r[go];
       assign bcu_pat_len_flat[go*16 +: 16]    = bcu_pat_len_r[go];
       assign bcu_dpll_cfg_flat[go*16 +: 16]   = bcu_dpll_cfg_r[go];
-      assign bcu_tx_data_flat[go*16 +: 16]    = bcu_tx_data_r[go];
+      assign bcu_tx_data_flat[go*16 +: 16] = 16'h0000;
     end
   endgenerate
 
@@ -154,13 +163,13 @@ module hamming_csr (
           4'h4: read_value = bcu_mode_r[read_bank];
           4'h5: read_value = bcu_crc_poly_r[read_bank][15:0];
           4'h6: read_value = bcu_crc_poly_r[read_bank][31:16];
-          4'h7: read_value = bcu_crc_state_r[read_bank][15:0];
-          4'h8: read_value = bcu_crc_state_r[read_bank][31:16];
+          4'h7: read_value = bcu_crc_live_flat[read_bank*32 +: 16];
+          4'h8: read_value = bcu_crc_live_flat[read_bank*32+16 +: 16];
           4'h9: read_value = bcu_bit_len_r[read_bank];
           4'hA: read_value = bcu_pat_match_r[read_bank];
           4'hB: read_value = bcu_pat_len_r[read_bank];
           4'hC: read_value = bcu_dpll_cfg_r[read_bank];
-          4'hD: read_value = bcu_tx_data_r[read_bank];
+          4'hD: read_value = 16'h0000;
           4'hE: read_value = bcu_rx_data_flat[read_bank*16 +: 16];
           4'hF: read_value = bcu_stat_flat[read_bank*16 +: 16];
           default: read_value = 16'h0000;
@@ -176,6 +185,8 @@ module hamming_csr (
           CSR_TIMER_LO:      read_value = timer_r[15:0];
           CSR_TIMER_HI:      read_value = {12'b0, timer_r[19:16]};
           CSR_RLE_BASE:      read_value = rle_base_r;
+            CSR_RLE_CTRL:      read_value = rle_ctrl_r;
+            CSR_RLE_PROBE_MASK: read_value = rle_probe_mask_r;
           CSR_RLE_MASK:      read_value = rle_mask_r;
           CSR_RLE_WR_PTR:    read_value = rle_wr_ptr;
           CSR_RLE_STATUS:    read_value = rle_status;
@@ -217,13 +228,10 @@ module hamming_csr (
         4'h4: bcu_mode_r[bank] <= value;
         4'h5: bcu_crc_poly_r[bank][15:0] <= value;
         4'h6: bcu_crc_poly_r[bank][31:16] <= value;
-        4'h7: bcu_crc_state_r[bank][15:0] <= value;
-        4'h8: bcu_crc_state_r[bank][31:16] <= value;
         4'h9: bcu_bit_len_r[bank] <= value;
         4'hA: bcu_pat_match_r[bank] <= value;
         4'hB: bcu_pat_len_r[bank] <= value;
         4'hC: bcu_dpll_cfg_r[bank] <= value;
-        4'hD: bcu_tx_data_r[bank] <= value;
         default: begin end
       endcase
     end
@@ -265,6 +273,8 @@ module hamming_csr (
       ctrl_run_r <= 4'h0;
       ev_flags_r <= 8'h00;
       timer_r <= 20'd0;
+      rle_ctrl_r <= 16'h0000;
+      rle_probe_mask_r <= 16'h0000;
       rle_base_r <= 16'h0000;
       rle_mask_r <= 16'h0000;
       pin_filt_en_r <= 8'h00;
@@ -279,12 +289,10 @@ module hamming_csr (
       for (ri = 0; ri < 4; ri = ri + 1) begin
         bcu_mode_r[ri] <= 16'h0000;
         bcu_crc_poly_r[ri] <= 32'h00000000;
-        bcu_crc_state_r[ri] <= 32'h00000000;
         bcu_bit_len_r[ri] <= 16'h0000;
         bcu_pat_match_r[ri] <= 16'h0000;
         bcu_pat_len_r[ri] <= 16'h0000;
         bcu_dpll_cfg_r[ri] <= 16'h0000;
-        bcu_tx_data_r[ri] <= 16'h0000;
       end
     end else begin
       timer_r <= timer_r + 1'b1;
@@ -324,6 +332,8 @@ module hamming_csr (
             CSR_EV_FLAGS:      ev_flags_r <= host_wdata[7:0];
             CSR_RLE_BASE:      rle_base_r <= host_wdata;
             CSR_RLE_MASK:      rle_mask_r <= host_wdata;
+            CSR_RLE_CTRL:      rle_ctrl_r <= host_wdata;
+            CSR_RLE_PROBE_MASK: rle_probe_mask_r <= host_wdata;
             CSR_PIN_FILT_EN:   pin_filt_en_r <= host_wdata[7:0];
             CSR_OPEN_DRAIN_EN: open_drain_en_r <= host_wdata[7:0];
             CSR_PIN_ROUTER0:   pin_router_r[0] <= host_wdata;
@@ -339,5 +349,52 @@ module hamming_csr (
       end
     end
   end
+
+
+  // CRC seed half-write strobes: a write to BCU_CRC_STATE_LO (offset 7) or
+  // BCU_CRC_STATE_HI (offset 8) in bank k pulses the matching write-enable
+  // for one cycle and presents the written data on that bank's seed bus.
+  // The CRC engine inside each BCU is the sole state storage.
+  integer swc;
+  reg [7:0] swaddr;
+  always @* begin
+    crc_lo_we = 4'h0;
+    crc_hi_we = 4'h0;
+    crc_seed_flat = 64'h0;
+    rle_sticky_clr = 1'b0;
+    if (host_we) begin
+      if (host_addr == CSR_RLE_CTRL && host_wdata[8])
+        rle_sticky_clr = 1'b1;
+      if (host_addr >= CSR_CORE_BANK && host_addr < 8'h80) begin
+        swaddr = (host_addr - CSR_CORE_BANK) >> 4;
+        if (host_addr[3:0] == 4'h7) begin
+          crc_lo_we[swaddr[1:0]] = 1'b1;
+          crc_seed_flat[swaddr[1:0]*16 +: 16] = host_wdata;
+        end
+        if (host_addr[3:0] == 4'h8) begin
+          crc_hi_we[swaddr[1:0]] = 1'b1;
+          crc_seed_flat[swaddr[1:0]*16 +: 16] = host_wdata;
+        end
+      end
+    end
+    for (swc = 0; swc < 4; swc = swc + 1) begin
+      if (core_we[swc]) begin
+        swaddr = core_waddr_flat[swc*8 +: 8];
+        if (swaddr == CSR_CORE_BANK + swc*16 + 7) begin
+          crc_lo_we[swc] = 1'b1;
+          crc_seed_flat[swc*16 +: 16] = core_wdata_flat[swc*16 +: 16];
+        end
+        if (swaddr == CSR_CORE_BANK + swc*16 + 8) begin
+          crc_hi_we[swc] = 1'b1;
+          crc_seed_flat[swc*16 +: 16] = core_wdata_flat[swc*16 +: 16];
+        end
+        if (swaddr == CSR_EV_SET || swaddr == CSR_EV_CLR) begin
+        end
+      end
+    end
+  end
+
+  assign rle_ctrl = rle_ctrl_r;
+  assign rle_probe_mask = rle_probe_mask_r;
 
 endmodule
