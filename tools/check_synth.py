@@ -124,6 +124,7 @@ def main():
         ("hamming_lut_matrix", ["hamming_lut_matrix.v"]),
         ("hamming_bcu", ["hamming_bcu.v", "hamming_bcu_crc.v",
                          "hamming_bcu_dpll.v"]),
+        ("hamming_rle_engine", ["hamming_rle_engine.v"]),
     ]
     unit_ff_counts = {}
     for unit_top, files in unit_modules:
