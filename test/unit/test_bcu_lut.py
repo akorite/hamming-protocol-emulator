@@ -102,3 +102,131 @@ def test_router_open_drain_clamp():
 def test_lut_output_register_enable():
     _run("test_lut_output_register_enable", _build_lut, "hamming_lut_matrix",
          module="cocotb_lut")
+
+
+@lru_cache(maxsize=None)
+def _build_dpll():
+    build_dir = BUILD_ROOT / "dpll"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    runner = get_runner("icarus")
+    runner.build(
+        sources=[str(SRC / "hamming_bcu_dpll.v")],
+        hdl_toplevel="hamming_bcu_dpll",
+        defines={"SIM": 1, "FUNCTIONAL": 1},
+        includes=[str(SRC)],
+        build_dir=str(build_dir),
+        always=True,
+    )
+    return runner, build_dir
+
+
+def test_free_run_sample_period():
+    _run("test_free_run_sample_period", _build_dpll, "hamming_bcu_dpll",
+         module="cocotb_dpll")
+
+
+def test_hard_snap_rephase():
+    _run("test_hard_snap_rephase", _build_dpll, "hamming_bcu_dpll",
+         module="cocotb_dpll")
+
+
+def test_hold_off_rejects_midcell():
+    _run("test_hold_off_rejects_midcell", _build_dpll, "hamming_bcu_dpll",
+         module="cocotb_dpll")
+
+
+def test_hold_off_accepts_boundary():
+    _run("test_hold_off_accepts_boundary", _build_dpll, "hamming_bcu_dpll",
+         module="cocotb_dpll")
+
+
+def test_eof_count_nine():
+    _run("test_eof_count_nine", _build_dpll, "hamming_bcu_dpll",
+         module="cocotb_dpll")
+
+
+def test_no_samples_when_stopped():
+    _run("test_no_samples_when_stopped", _build_dpll, "hamming_bcu_dpll",
+         module="cocotb_dpll")
+
+
+@lru_cache(maxsize=None)
+def _build_bcu():
+    build_dir = BUILD_ROOT / "bcu"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    runner = get_runner("icarus")
+    runner.build(
+        sources=[str(SRC / "hamming_bcu.v"), str(SRC / "hamming_bcu_crc.v"),
+                 str(SRC / "hamming_bcu_dpll.v")],
+        hdl_toplevel="hamming_bcu",
+        defines={"SIM": 1, "FUNCTIONAL": 1},
+        includes=[str(SRC)],
+        build_dir=str(build_dir),
+        always=True,
+    )
+    return runner, build_dir
+
+
+def test_nrz_loopback_lsb():
+    _run("test_nrz_loopback_lsb", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_nrz_loopback_msb():
+    _run("test_nrz_loopback_msb", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_nrzi_loopback_diff():
+    _run("test_nrzi_loopback_diff", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_manchester_rx_decode():
+    _run("test_manchester_rx_decode", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_manchester_tx_waveform():
+    _run("test_manchester_tx_waveform", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_extclk_rx_reassembly():
+    _run("test_extclk_rx_reassembly", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_pattern_matcher_sfd():
+    _run("test_pattern_matcher_sfd", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_crc_feed_tx():
+    _run("test_crc_feed_tx", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_usb6_stuff_trailing_before_eop():
+    _run("test_usb6_stuff_trailing_before_eop", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_usb6_rx_stuff_err_and_dribble():
+    _run("test_usb6_rx_stuff_err_and_dribble", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_can5_unstuff_rx():
+    _run("test_can5_unstuff_rx", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_bit_len_partial_transfer():
+    _run("test_bit_len_partial_transfer", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")
+
+
+def test_tx_empty_and_shadow_streaming():
+    _run("test_tx_empty_and_shadow_streaming", _build_bcu, "hamming_bcu",
+         module="cocotb_bcu_top")

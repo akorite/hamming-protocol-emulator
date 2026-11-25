@@ -122,6 +122,8 @@ def main():
         ("hamming_core", ["hamming_icache.v", "hamming_core.v"]),
         ("hamming_bcu_crc", ["hamming_bcu_crc.v"]),
         ("hamming_lut_matrix", ["hamming_lut_matrix.v"]),
+        ("hamming_bcu", ["hamming_bcu.v", "hamming_bcu_crc.v",
+                         "hamming_bcu_dpll.v"]),
     ]
     unit_ff_counts = {}
     for unit_top, files in unit_modules:
@@ -165,6 +167,19 @@ def main():
         )
         if lut_ffs > 730:
             sys.exit(f"check_synth: lut matrix {lut_ffs} FFs exceeds 730 budget")
+
+    # U5 plan gate: one BCU including its CRC engine and DPLL must stay at
+    # or below 270 flip-flops.  The CRC and DPLL submodule counts are
+    # reported separately by their own entries but included here because
+    # yosys reports hierarchical instance counts at the top level.
+    if "hamming_bcu" in unit_ff_counts:
+        bcu_ffs, bcu_cells = unit_ff_counts["hamming_bcu"]
+        print(
+            f"check_synth: bcu total: {bcu_ffs} flip-flops "
+            f"(budget 270), {bcu_cells} cells"
+        )
+        if bcu_ffs > 270:
+            sys.exit(f"check_synth: bcu {bcu_ffs} FFs exceeds 270 budget")
 
 
 if __name__ == "__main__":

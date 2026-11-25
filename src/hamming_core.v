@@ -34,6 +34,7 @@ module hamming_core #(
     input  wire [15:0] csr_rdata,
 
     output wire        bcu_tx_push,
+  output wire        bcu_rx_pop,
     output wire [15:0] bcu_tx_data,
     input  wire [15:0] bcu_rx_data,
     input  wire [15:0] bcu_stat,
@@ -267,6 +268,8 @@ module hamming_core #(
 
   assign bcu_tx_push = exec_valid && instr_legal && major == `HAM_MAJOR_BCU &&
                        sub == `HAM_BCU_TX;
+  assign bcu_rx_pop = exec_valid && instr_legal && major == `HAM_MAJOR_BCU &&
+                      sub == `HAM_BCU_RX;
   assign bcu_tx_data = rf_32;
 
   wire [15:0] wait_delta16 = (sub == `HAM_TIM_WAIT_PHASE_RS) ? rf_32 : {8'h00, instr[7:0]};

@@ -230,10 +230,23 @@ BCU_CRC_HI = 1
 #   [3:2]  reserved (write zero)
 #   [7:4]  win      edge acceptance / hold-off window in cycles-1 (0 = 1)
 #   [15:8] period   symbol (bit cell) period in system cycles
+#
+# BCU_BIT_LEN[15:0]:
+#   [3:0]  len-1         transfer length minus one (0..15 selects 1..16)
+#   [4]    wire_msb      0 = wire order LSB-first, 1 = MSB-first
+#   [15:5] reserved (write zero)
+#
+# Codec timing note: nrz/nrzi/nrz_extclk serialize one bit per DPLL cell of
+# `period` cycles. manchester/diff_manchester/pwm_rz treat `period` as the
+# HALF-cell interval, so a full bit spans two sample ticks. Manchester uses
+# the IEEE 802.3 convention: first half-cell = complement of the data bit,
+# second half-cell = the data bit itself. pwm_rz drives the data level in
+# the first half-cell and returns to zero in the second.
 # ---------------------------------------------------------------------------
 
 BCU_CODEC = {
     "nrz": 0, "nrzi": 1, "manchester": 2, "diff_manchester": 3, "pwm_rz": 4,
+    "nrz_extclk": 5,
 }
 BCU_CODEC_NAMES = {v: k for k, v in BCU_CODEC.items()}
 
