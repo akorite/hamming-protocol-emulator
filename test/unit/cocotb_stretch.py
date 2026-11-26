@@ -26,6 +26,8 @@ from tools import hamming_isa as isa  # noqa: E402
 from cocotb_baseline import (  # noqa: E402
     CSR_CTRL_RUN,
     SRC_CORE,
+    SRC_BCU_P,
+    SRC_BCU_N,
     clear_mailbox,
     configure_waveform_pin,  # noqa: F401  (re-exported for MITM use)
     core_status,
@@ -54,6 +56,218 @@ from cocotb_baseline import (  # noqa: E402
 from bfm.can_bfm import (  # noqa: E402
     CANBus, CANNodeBfm, CANProtocolError, encode_frame_bits,
 )
+from bfm.eth_bfm import (  # noqa: E402
+    Eth10BaseTNode, EthWire, EthernetProtocolError, mutate_fcs_bits,
+)
+
+
+# ----------------------------------------------------------------------
+# 10BASE-T fabric configuration.  Core0/BCU0 transmits on the dedicated
+# output pins.  Both TX pins must be paired with BCU0: router channels 16
+# (uo0) and 20 (uo4) both have channel-index low bits 0.  Core1/BCU1 receives
+# the external comparator pair through LUT2/LUT3.
+# ----------------------------------------------------------------------
+ETH_TXP_PIN = 0     # uo_out[0], router channel 16
+ETH_TXN_PIN = 4     # uo_out[4], router channel 20
+ETH_RXP_PIN = 0     # ui_in[0], tier-1 pin input 8
+ETH_RXN_PIN = 1     # ui_in[1], tier-1 pin input 9
+
+
+async def configure_eth_pins(dut, invert_rx=False):
+    await write_pin_router(dut, {
+        16: SRC_BCU_P,      # uo0 <- BCU0 tx_p
+        20: SRC_BCU_N,      # uo4 <- BCU0 tx_n
+    })
+    tt = 0x5555 if invert_rx else lut_tt_identity_in0()
+    # Swapping the pair is the inversion that corrects the sampled
+    # half-cell pairing, while crucially preserving idle as (0,0).
+    await write_lut(dut, 2, tt, (9, 15, 15, 15))
+    await write_lut(dut, 3, tt, (8, 15, 15, 15))
+
+
+def make_eth_wire(dut):
+    wire = EthWire(
+        dut.clk,
+        lambda level: drive_ui_bit(dut, ETH_RXP_PIN, level),
+        lambda level: drive_ui_bit(dut, ETH_RXN_PIN, level),
+        lambda: uo_bit(dut, ETH_TXP_PIN),
+        lambda: uo_bit(dut, ETH_TXN_PIN),
+    )
+    wire.start_monitor()
+    return wire
+
+
+def eth_frame60(tag=0):
+    """Deterministic minimum-size frame: broadcast dst, locally administered
+    source, length field 46, then 46 pad bytes.  The length field is a valid
+    IEEE 802.3 length rather than an EtherType."""
+    frame = bytearray(bytes.fromhex("ffffffffffff"))
+    frame.extend((0x02, 0x00, 0x5e, 0x10, tag & 0xFF, 0x01))
+    frame.extend((46).to_bytes(2, "big"))
+    frame.extend(((tag + i) & 0xFF) for i in range(46))
+    assert len(frame) == 60
+    return bytes(frame)
+
+
+def eth_mailbox_header(frame_len, repeat=0):
+    return bytes([1, 0, frame_len & 0xFF, (frame_len >> 8) & 0xFF,
+                  0, 0, 0, repeat & 0xFF])
+
+
+async def queue_eth_tx(dut, frame, repeat=0):
+    """Write the TX mailbox/frame through Host SPI and raise EV1."""
+    await write_sram1_bytes(dut, 0, eth_mailbox_header(len(frame), repeat))
+    # The frame base 0x10 is word aligned; write the whole 60-byte minimum or
+    # rounded payload in as few burst transactions as the aligned helper allows.
+    data = bytes(frame)
+    pad = (-len(data)) % 4
+    await write_sram1_bytes(dut, 0x10, data + bytes(pad))
+    await write_csr(dut, isa.CSR["EV_SET"], 0x0002)
+
+
+async def eth_wait_tx_status(dut, timeout_writes=30):
+    for _ in range(timeout_writes):
+        status = (await read_sram1_bytes(dut, 0, 4))[1]
+        if status & 1:
+            return status
+    raise AssertionError("Ethernet TX done status never appeared")
+
+
+async def assert_eth_core_clean(dut):
+    for core in (0, 1):
+        st = await core_status(dut, core)
+        assert (st >> 3) & 1 == 0, \
+            f"Ethernet core{core} deadline_missed status {st:#x}"
+
+
+async def _eth_tx_case(dut, frame, first_clock=True):
+    """DUT transmits one frame; the independent BFM validates every layer."""
+    await reset_dut(dut, start_clock=first_clock)
+    prog = await load_firmware(dut, "eth_10baset.hasm")
+    await configure_eth_pins(dut)
+    await clear_mailbox(dut)
+    wire = make_eth_wire(dut)
+    node = Eth10BaseTNode(wire)
+    capture_task = cocotb.start_soon(node.capture_frame(timeout_cycles=180000))
+    await queue_eth_tx(dut, frame)
+    await write_csr(dut, CSR_CTRL_RUN, 0x0003)
+    result = await capture_task
+    assert not wire.errors, f"Ethernet electrical violations: {wire.errors}"
+    assert not result.halfcell_violations, \
+        f"Manchester half-cell violations: {result.halfcell_violations[:3]}"
+    assert result.frame == bytes(frame), \
+        f"Ethernet TX payload mismatch: {result.frame.hex()} vs {bytes(frame).hex()}"
+    assert result.residue == 0xDEBB20E3
+    assert 15 <= result.tp_idl_cycles <= 18, \
+        f"TP_IDL pulse {result.tp_idl_cycles} cycles outside 15..18"
+    status = await eth_wait_tx_status(dut)
+    assert status & 1, f"Ethernet TX status 0x{status:02x}"
+    await assert_eth_core_clean(dut)
+    return result, prog
+
+
+@cocotb.test()
+async def test_eth10baset_tx_frame(dut):
+    """10BASE-T TX: minimum-size frame, Manchester/SFD/FCS/TP_IDL checked."""
+    await _eth_tx_case(dut, eth_frame60(0x21), first_clock=True)
+
+
+async def eth_wait_status_mask(dut, mask, timeout_writes=240):
+    for _ in range(timeout_writes):
+        status = (await read_sram1_bytes(dut, 0, 4))[1]
+        if status & mask:
+            return status
+    # Failure diagnostics are deliberately host-observable architectural
+    # state, not waveform-only guessing: core PC, BCU mode/DPLL/status/live
+    # CRC, and the leading capture bytes.
+    pc = await read_csr(dut, isa.CSR_CORE_BANK + 0x10 + 1)
+    mode = await read_csr(dut, isa.CSR_CORE_BANK + 0x10 + 4)
+    dpll = await read_csr(dut, isa.CSR_CORE_BANK + 0x10 + 12)
+    stat = await read_csr(dut, isa.CSR_CORE_BANK + 0x10 + 15)
+    crclo = await read_csr(dut, isa.CSR_CORE_BANK + 0x10 + 7)
+    crchi = await read_csr(dut, isa.CSR_CORE_BANK + 0x10 + 8)
+    cap = await read_sram1_bytes(dut, 0x08, 80)
+    dut._log.info(
+        "ETH RX diag pc=%03x mode=%04x dpll=%04x stat=%04x crc=%04x%04x cap=%s",
+        pc, mode, dpll, stat, crchi, crclo, cap.hex())
+    raise AssertionError(f"Ethernet status mask 0x{mask:02x} never appeared")
+
+
+async def _eth_rx_start(dut):
+    await reset_dut(dut, start_clock=True)
+    await load_firmware(dut, "eth_10baset.hasm")
+    await configure_eth_pins(dut)
+    await clear_mailbox(dut)
+    wire = make_eth_wire(dut)
+    await write_csr(dut, CSR_CTRL_RUN, 0x0003)
+    return wire, Eth10BaseTNode(wire)
+
+
+async def _eth_rx_case(dut, frame, jitter_pattern=None):
+    wire, node = await _eth_rx_start(dut)
+    await node.send_frame(frame, jitter_pattern=jitter_pattern)
+    status = await eth_wait_status_mask(dut, 0x02)
+    assert status & 0x02, f"Ethernet RX valid missing, status 0x{status:02x}"
+    assert not (status & 0x70), f"Ethernet RX error status 0x{status:02x}"
+    hdr = await read_sram1_bytes(dut, 0, 8)
+    rx_len = hdr[4] | (hdr[5] << 8)
+    assert rx_len == len(frame), f"RX length {rx_len}, expected {len(frame)}"
+    pad = (-len(frame)) % 4
+    got = (await read_sram1_bytes(dut, 0x10, len(frame) + pad))[:len(frame)]
+    assert got == bytes(frame), \
+        f"RX frame mismatch: {got.hex()} vs {bytes(frame).hex()}"
+    await assert_eth_core_clean(dut)
+    return status
+
+
+@cocotb.test()
+async def test_eth10baset_tx_repeat_ifg(dut):
+    """Back-to-back TX repeat: both frames valid and inter-frame gap >= 9.6 us."""
+    frame = eth_frame60(0x42)
+    await reset_dut(dut, start_clock=True)
+    await load_firmware(dut, "eth_10baset.hasm")
+    await configure_eth_pins(dut)
+    await clear_mailbox(dut)
+    wire = make_eth_wire(dut)
+    node = Eth10BaseTNode(wire)
+    first_task = cocotb.start_soon(node.capture_frame(timeout_cycles=180000))
+    await queue_eth_tx(dut, frame, repeat=1)
+    await write_csr(dut, CSR_CTRL_RUN, 0x0003)
+    first = await first_task
+    second = await node.capture_frame(timeout_cycles=20000)
+    assert first.frame == frame and second.frame == frame
+    ifg = second.start_cycle - first.idle_start_cycle
+    assert ifg >= 576, f"IFG {ifg} cycles below 576-cycle minimum"
+    assert 15 <= first.tp_idl_cycles <= 18
+    assert 15 <= second.tp_idl_cycles <= 18
+    status = await eth_wait_tx_status(dut)
+    assert status & 1
+    await assert_eth_core_clean(dut)
+    dut._log.info("ETH TX measured IFG cycles=%d", ifg)
+
+
+@cocotb.test()
+async def test_eth10baset_rx_frame(dut):
+    """10BASE-T RX: clean independent peer frame, exact payload/length."""
+    await _eth_rx_case(dut, eth_frame60(0x34))
+
+
+@cocotb.test()
+async def test_eth10baset_rx_jitter(dut):
+    """10BASE-T RX with +/-1 cycle bit-center jitter inside the DPLL window."""
+    await _eth_rx_case(dut, eth_frame60(0x35), jitter_pattern=[-1, 1, 0, 1, -1, 0])
+
+
+@cocotb.test()
+async def test_eth10baset_rx_bad_fcs(dut):
+    """A one-bit FCS mutation must never set RX-valid (non-vacuity)."""
+    frame = eth_frame60(0x36)
+    wire, node = await _eth_rx_start(dut)
+    await node.send_frame(frame, fcs_mutate=0)
+    status = await eth_wait_status_mask(dut, 0x72)
+    assert status & 0x20, f"corrupted FCS was not rejected: status 0x{status:02x}"
+    assert not (status & 0x02), f"corrupted FCS falsely set RX valid: 0x{status:02x}"
+    await assert_eth_core_clean(dut)
 
 
 # ----------------------------------------------------------------------

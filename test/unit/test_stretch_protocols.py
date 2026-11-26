@@ -118,6 +118,67 @@ def test_can_codec_enforces_stuffing_rule():
 
 
 # ----------------------------------------------------------------------
+# Pure-BFM Ethernet non-vacuity checks: good frames decode, FCS mutations and
+# Manchester pairing violations must be rejected before any silicon is trusted.
+# ----------------------------------------------------------------------
+def test_eth_codec_roundtrip_and_rejects_bad_fcs():
+    import sys
+    if str(ROOT / "test") not in sys.path:
+        sys.path.insert(0, str(ROOT / "test"))
+    from bfm.eth_bfm import (
+        EthernetProtocolError, decode_frame_bits, frame_bits, mutate_fcs_bits,
+    )
+    frame = bytes.fromhex("ffffffffffff02005e102101002e") + bytes(range(46))
+    assert len(frame) == 60
+    good = decode_frame_bits(frame_bits(frame))
+    assert good["frame"] == frame
+    assert good["residue"] == 0xDEBB20E3
+    bad = mutate_fcs_bits(frame, 0)
+    with pytest.raises(EthernetProtocolError):
+        decode_frame_bits(bad)
+
+
+def test_eth_manchester_pairing_nonvacuity():
+    import sys
+    if str(ROOT / "test") not in sys.path:
+        sys.path.insert(0, str(ROOT / "test"))
+    from bfm.eth_bfm import (
+        EthernetProtocolError, frame_bits, manchester_cells,
+        manchester_decode_cells,
+    )
+    frame = bytes(60)
+    cells = manchester_cells(frame_bits(frame)[:32])
+    assert len(manchester_decode_cells(cells)) == 32
+    bad = list(cells)
+    bad[2] = bad[3]     # destroy the required complement relationship
+    with pytest.raises(EthernetProtocolError):
+        manchester_decode_cells(bad)
+
+
+# ----------------------------------------------------------------------
+# Chip-level Ethernet tests
+# ----------------------------------------------------------------------
+def test_eth10baset_tx_frame():
+    _run("test_eth10baset_tx_frame")
+
+
+def test_eth10baset_tx_repeat_ifg():
+    _run("test_eth10baset_tx_repeat_ifg")
+
+
+def test_eth10baset_rx_frame():
+    _run("test_eth10baset_rx_frame")
+
+
+def test_eth10baset_rx_jitter():
+    _run("test_eth10baset_rx_jitter")
+
+
+def test_eth10baset_rx_bad_fcs():
+    _run("test_eth10baset_rx_bad_fcs")
+
+
+# ----------------------------------------------------------------------
 # Chip-level CAN tests
 # ----------------------------------------------------------------------
 def test_can20a_tx_frame():

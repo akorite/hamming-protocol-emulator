@@ -1,0 +1,667 @@
+; SPDX-FileCopyrightText: 2026 akorite
+; SPDX-License-Identifier: Apache-2.0
+;
+; Hamming 10BASE-T Ethernet firmware (10 Mbps, 6 cycles/bit at 60 MHz).
+;
+; Architecture: core0 owns the transmitter and core1 owns the receiver.
+; TX uses the same builder+playback split as the proven CAN firmware, but
+; the wire-speed playback object is much smaller: the builder leaves a
+; contiguous octet stream (preamble/SFD, host frame, software-computed FCS)
+; in SRAM1, while a cache-resident loop keeps the BCU Manchester serializer's
+; one-byte shadow filled.  The BCU, not firmware bit-banging, generates the
+; exact 3-cycle Manchester half-cells.  CRC-32 is computed in software before
+; transmission, so no playback cycle depends on the CRC latency.
+;
+; RX uses BCU1 in differential-input Manchester mode.  The external 10BASE-T
+; receiver/comparator is modeled as two digital inputs: positive half-cells
+; assert RXP, negative half-cells assert RXN, and idle asserts neither.  That
+; three-state input is essential: the BCU treats both-low as SE0, so idle
+; samples never enter the CRC after the frame.  The CRC seed is algebraically
+; precompensated for the constant 64 preamble+SFD bits; after those bits the
+; engine is exactly in the standard all-ones state, so a correct frame leaves
+; raw residue 0xDEBB20E3 with no timing-critical reset.
+;
+; Pin plan (fabric configuration is host-side):
+;   uo0 = BCU0 tx_p (TX+)      uo4 = BCU0 tx_n (TX-)
+;   ui0 = RXP -> LUT2 -> BCU1 rx_p
+;   ui1 = RXN -> LUT3 -> BCU1 rx_n
+;
+; SRAM1 byte map:
+;   0     control: bit0 TX frame queued
+;   1     status: bit0 TX done, bit1 RX valid, 0x10 bad RX structure/SFD,
+;                 0x20 bad RX FCS, 0x40 RX overrun
+;   2..3  TX frame length, little endian, excluding preamble/SFD and FCS
+;   4..5  RX frame length, little endian, excluding FCS (written on success)
+;   6     reserved
+;   7     repeat count: number of additional transmissions of the same frame
+;   0x08..0x0f generated 7x0x55 + 0xD5 prefix
+;   0x10..0x5fd packet octets.  Host writes TX frame bytes at 0x10.  RX also
+;         captures at 0x08 (preamble first), so decoded frame octets land at
+;         0x10.  TX and RX reuse this single full-size packet region; a max
+;         TX stream ends at 0x5fe exclusive.  Simultaneous max-size TX and RX
+;         buffering is physically impossible in 2 KiB and is not claimed.
+;   0x600..0x77f declared RLE ring region (untouched by this firmware)
+;   0x780..0x793 firmware scratch (outside the packet/RLE regions)
+;
+; Link pulses: idle core0 performs sixteen interruptible anchored 1 ms
+; intervals (16 ms nominal at 60 MHz).  EV_FLAGS[1] is the host TX-queue wake
+; and EV_FLAGS[0] is the RX-valid wake; either cancels the idle wait promptly.
+; After a frame the fixed 576-cycle (9.6 us) IFG is enforced before a repeat
+; or before TX-done is reported.  The full 16 ms RTL cadence can therefore be
+; shortened only by shrinking simulation time externally; the firmware itself
+; implements the nominal 16 x 60000 cycle schedule.
+
+.protocol eth_10baset @clk 60MHz
+.constraint eth_bit_period = 6 cycles at 10Mbps
+.constraint eth_inter_frame_gap = 576 cycles minimum
+
+; ----------------------------------------------------------------------
+; Architected core dispatch (same CORE_ID trick as the proven CAN image).
+; ----------------------------------------------------------------------
+eth_entry:
+    csr_rd r1, 0x4d
+    mov r1, r1
+    jz eth_tx_core
+    ldi8.l r0, 1
+    cmp r1, r0
+    jz eth_rx_core
+    halt
+
+
+; ======================================================================
+; Core0: idle NLP scheduler and transmit builder/playback.
+; ======================================================================
+eth_tx_core:
+    bcu_ctrl 0x00
+
+; r3 is the number of remaining 1 ms intervals before one NLP.
+tx_idle:
+    ldi8.l r3, 16
+    ldi8.h r3, 0
+tx_idle_wait:
+    ldi8.l r2, 0x60
+    ldi8.h r2, 0xea        ; 60000 cycles = anchored 1 ms interval
+    sync_event 0x3, r2     ; EV0 RX-valid or EV1 host-TX wake cancels idle
+    csr_rd r0, 0x01        ; EV_FLAGS
+    mov r0, r0
+    jnz tx_event
+    dec r3
+    jnz tx_idle_wait
+    call tx_nlp
+    jmp tx_idle
+
+tx_event:
+    ldi8.l r0, 3
+    ldi8.h r0, 0
+    csr_wr r0, 0x03        ; EV_CLR: consume the wake events
+    ldi8.l r2, 0
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]     ; control byte
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    and r0, r2
+    jz tx_idle             ; RX wake without queued TX work: resume idle
+
+
+; ----------------------------------------------------------------------
+; TX phase 1: relaxed builder.  Generate the constant prefix in place,
+; compute reflected CRC-32 over the frame, and append the little-endian
+; complemented FCS.  r0/r1 are the live CRC low/high halves in crc_bit.
+; ----------------------------------------------------------------------
+tx_prepare:
+    ; ---- 7 x 0x55 then 0xd5 at bytes 0x08..0x0f ----
+    ldi8.l r2, 8
+    ldi8.h r2, 0
+    ldi8.l r3, 7
+    ldi8.h r3, 0
+    ldi8.l r0, 0x55
+    ldi8.h r0, 0
+tx_pre_loop:
+    st_dmem_b r0, [r2]
+    inc r2
+    dec r3
+    jnz tx_pre_loop
+    ldi8.l r0, 0xd5
+    st_dmem_b r0, [r2]
+
+    ; ---- load TX byte count from mailbox bytes 2/3 into scratch word 0x1e0 ----
+    ldi8.l r2, 2
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]     ; low length byte
+    inc r2
+    ld_dmem_b r3, [r2]     ; high length byte
+    shl r3
+    shl r3
+    shl r3
+    shl r3
+    shl r3
+    shl r3
+    shl r3
+    shl r3
+    or r0, r3
+    ldi8.l r2, 0xe0
+    ldi8.h r2, 1
+    st_dmem_w r0, [r2]     ; bytes remaining
+
+    ; ---- byte pointer starts at host frame base 0x10 in scratch word 0x1e1 ----
+    ldi8.l r0, 0x10
+    ldi8.h r0, 0
+    st_dmem_w r0, [r2+1]
+
+    ; ---- reflected CRC-32 initial state ----
+    ldi8.l r0, 0xff
+    ldi8.h r0, 0xff
+    ldi8.l r1, 0xff
+    ldi8.h r1, 0xff
+
+tx_crc_byte_loop:
+    ldi8.l r2, 0xe0
+    ldi8.h r2, 1
+    ld_dmem_w r3, [r2]     ; bytes remaining
+    mov r3, r3
+    jz tx_crc_done
+    dec r3
+    st_dmem_w r3, [r2]
+
+    ; Atomically use the post-incremented pointer trick: store ptr+1 first,
+    ; restore the original value in r3, then load the byte through it.
+    ld_dmem_w r3, [r2+1]
+    inc r3
+    st_dmem_w r3, [r2+1]
+    dec r3
+    ld_dmem_b r3, [r3]     ; frame byte, zero-extended
+    xor r0, r3             ; reflected nibble loop first XORs the whole byte
+    call crc_nibble
+    call crc_nibble
+    jmp tx_crc_byte_loop
+
+tx_crc_done:
+    ; Ethernet FCS is the bitwise complement, serialized little-endian with
+    ; each octet LSB-first on the wire.
+    not r0, r0
+    not r1, r1
+
+    ldi8.l r2, 0xe0
+    ldi8.h r2, 1
+    ld_dmem_w r3, [r2+1]   ; append pointer (end of host frame)
+
+    st_dmem_b r0, [r3]     ; FCS byte 0 (crc bits 7..0)
+    inc r3
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    st_dmem_b r0, [r3]     ; FCS byte 1
+    inc r3
+    st_dmem_b r1, [r3]     ; FCS byte 2
+    inc r3
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    st_dmem_b r1, [r3]     ; FCS byte 3
+    inc r3
+
+    ; Total playback octets = end pointer - stream base 0x08.  Reuse scratch
+    ; word 0x1e0 as the playback byte count.
+    ldi8.l r2, 8
+    ldi8.h r2, 0
+    sub r3, r2
+    ldi8.l r2, 0xe0
+    ldi8.h r2, 1
+    st_dmem_w r3, [r2]
+
+
+; ----------------------------------------------------------------------
+; TX phase 2: configure BCU0 and prime the two-deep byte pipeline.
+;   r0 = scratch byte/stat, r1 = stream byte pointer,
+;   r2 = bytes not yet pushed, r3 = tx_empty mask (0x10)
+; ----------------------------------------------------------------------
+tx_playback_restart:
+    ; mode: Manchester, no stuffing/CRC = 0x03e2 (width field is inert here)
+    ldi8.l r0, 0xe2
+    ldi8.h r0, 0x03
+    csr_wr r0, 0x44
+    ; transfer length 8 bits, wire LSB-first
+    ldi8.l r0, 7
+    ldi8.h r0, 0
+    csr_wr r0, 0x49
+    ; Manchester half-cell timer: 3 cycles (DPLL mode bits unused for TX)
+    ldi8.l r0, 0x00
+    ldi8.h r0, 0x03
+    csr_wr r0, 0x4c
+
+    ldi8.l r2, 0xe0
+    ldi8.h r2, 1
+    ld_dmem_w r2, [r2]     ; total playback bytes
+    ldi8.l r1, 8
+    ldi8.h r1, 0           ; stream base
+
+    bcu_ctrl 0x01          ; tx_arm
+    ld_dmem_b r0, [r1]
+    bcu_tx r0              ; first byte goes directly into the serializer
+    inc r1
+    dec r2
+    ld_dmem_b r0, [r1]
+    bcu_tx r0              ; second byte fills the shadow
+    inc r1
+    dec r2
+    ldi8.l r3, 0x10
+    ldi8.h r3, 0           ; tx_empty bit mask
+    jmp tx_pb_poll
+
+
+; ----------------------------------------------------------------------
+; crc_nibble: one reflected CRC-32 nibble step.  r0/r1 are CRC low/high.
+; Uses r2/r3 and scratch word 0x1e3.  A 16-entry table of four-step nibble
+; transforms is kept in otherwise unused instruction memory at 0x300.  The
+; builder is untimed, so imem/dmem lookup latency is irrelevant; reducing 64
+; bitwise steps per octet to two nibble steps is what makes RTL regression
+; practical.
+; ----------------------------------------------------------------------
+crc_nibble:
+    ; idx = crc_low & 0x0f, saved while the 32-bit shift uses both scratch regs
+    mov r2, r0
+    ldi8.l r3, 0x0f
+    ldi8.h r3, 0
+    and r2, r3
+    ldi8.l r3, 0xe0
+    ldi8.h r3, 1
+    st_dmem_w r2, [r3+3]
+
+    ; crc >>= 4 across the 16-bit halves:
+    ;   low'=(low>>4)|((high&0xf)<<12), high'=high>>4
+    mov r2, r1
+    ldi8.l r3, 0x0f
+    ldi8.h r3, 0
+    and r2, r3
+    shl r2
+    shl r2
+    shl r2
+    shl r2
+    shl r2
+    shl r2
+    shl r2
+    shl r2
+    shl r2
+    shl r2
+    shl r2
+    shl r2
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    or r0, r2
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+
+    ; XOR the variable table entry.  Entries are low/high slot pairs at
+    ; crc_table (deliberately aligned to 0x300, so byte halves are 0/3).
+    ldi8.l r3, 0xe0
+    ldi8.h r3, 1
+    ld_dmem_w r2, [r3+3]
+    shl r2                  ; two instruction slots per 32-bit entry
+    ldi8.l r3, 0x00
+    ldi8.h r3, 0x03
+    add r3, r2
+    ld_imem r2, [r3]
+    xor r0, r2
+    inc r3
+    ld_imem r2, [r3]
+    xor r1, r2
+    ret
+
+
+; ----------------------------------------------------------------------
+; tx_nlp: one positive normal-link pulse.  NRZ mode, one bit of length one
+; at a 6-cycle cell produces TX+=1/TX-=0 for approximately 100 ns.  The wait
+; constant is intentionally small and verified at the pins in RTL.
+; ----------------------------------------------------------------------
+tx_nlp:
+    ldi8.l r0, 0xe0
+    ldi8.h r0, 0x03        ; NRZ, no CRC/stuffing
+    csr_wr r0, 0x44
+    ldi8.l r0, 0
+    ldi8.h r0, 0
+    csr_wr r0, 0x49        ; one-bit transfer
+    ldi8.l r0, 0x00
+    ldi8.h r0, 0x06
+    csr_wr r0, 0x4c        ; 6-cycle NRZ cell
+    bcu_ctrl 0x01
+    ldi8.l r0, 1
+    ldi8.h r0, 0
+    bcu_tx r0
+    set_anchor 0
+    wait_phase 7
+    bcu_ctrl 0x00
+    ret
+
+
+; ======================================================================
+; Core1: Manchester receiver.
+; ======================================================================
+eth_rx_core:
+    bcu_ctrl 0x00
+    ; mode: Manchester, CRC-32 enabled, reflected LSB-first, differential
+    ; three-state input = 0xc3e2.
+    ldi8.l r0, 0xe2
+    ldi8.h r0, 0xc3
+    csr_wr r0, 0x54
+    ; CRC polynomial 0xEDB88320
+    ldi8.l r0, 0x20
+    ldi8.h r0, 0x83
+    csr_wr r0, 0x55
+    ldi8.l r0, 0xb8
+    ldi8.h r0, 0xed
+    csr_wr r0, 0x56
+    ; The synchronized input edge is observed one half-cell late, so the
+    ; BCU's fixed initial half pairing skips wire bit0 and samples inverted
+    ; data (corrected by swapping the comparator pair in the LUTs).  Use one
+    ; 7-bit first transfer for wire bits 1..7, then switch to 8-bit bytes at
+    ; wire bit8, restoring octet alignment without any timing-critical shift.
+    ldi8.l r0, 6
+    ldi8.h r0, 0
+    csr_wr r0, 0x59
+    ; SFD wire pattern 10101011 appears as 0xab in rx_shift's oldest->newest
+    ; low-byte order.  It is a debug cross-check; the postprocess validates it.
+    ldi8.l r0, 0xab
+    ldi8.h r0, 0
+    csr_wr r0, 0x5a
+    ldi8.l r0, 8
+    ldi8.h r0, 0
+    csr_wr r0, 0x5b
+    ; Hold-off DPLL, 3-cycle Manchester half-cell, win=1.  win>=1 makes the
+    ; initial edge acceptance deterministic for this discrete 3-cycle grid.
+    ldi8.l r0, 0x12
+    ldi8.h r0, 0x03
+    csr_wr r0, 0x5c
+
+    ; Precompensated CRC seed.  The direct differential input locks at the
+    ; first boundary and captures all 64 constant preamble+SFD bits.  This
+    ; seed makes the state exactly all-ones when the first frame byte starts.
+    ldi8.l r0, 0x35
+    ldi8.h r0, 0x88
+    csr_wr r0, 0x57        ; live CRC low half = 0x8835
+    ldi8.l r0, 0x2a
+    ldi8.h r0, 0x07
+    csr_wr r0, 0x58        ; live CRC high half = 0x072a (skip 17 warmup bits)
+
+    ; Clear sticky RX state, then arm.  Do not use crc_reset: on this RTL the
+    ; live-state CSR is the seed port and the direct writes above are exact.
+    bcu_ctrl 0x30          ; soft_reset + stat_clear pulse
+    bcu_ctrl 0x00
+    bcu_ctrl 0x02          ; rx_arm
+
+    ldi8.l r1, 11
+    ldi8.h r1, 0           ; after two warmup preamble bytes, frame is at 0x10
+    ldi8.l r3, 0x20
+    ldi8.h r3, 0           ; rx_full mask
+    jmp rx_first_poll
+
+; First realignment transfer: discard wire bits 1..7 after their 7-bit
+; group completes, then reprogram the BCU to normal 8-bit bytes before bit8.
+rx_first_poll:
+    bcu_stat r0
+    and r0, r3
+    jz rx_first_poll
+    bcu_rx r0
+    ldi8.l r0, 7
+    ldi8.h r0, 0
+    csr_wr r0, 0x59
+    jmp rx_poll
+
+
+; ----------------------------------------------------------------------
+; Aligned hot loops.  Each fits exactly eight SRAM0 words = eight icache
+; lines (16 instruction slots), the proven hard cache wall.
+; ----------------------------------------------------------------------
+.org 0x200
+
+; TX playback hot loop.  The BCU shadow is empty exactly when a byte boundary
+; has just occurred, leaving almost the full 48-cycle byte time for service.
+tx_pb_poll:
+    bcu_stat r0
+    and r0, r3
+    jz tx_pb_poll
+    ld_dmem_b r0, [r1]
+    bcu_tx r0
+    inc r1
+    dec r2
+    jnz tx_pb_poll
+tx_pb_final_wait:
+    bcu_stat r0
+    and r0, r3
+    jz tx_pb_final_wait
+    set_anchor 0
+    wait_phase 58          ; tuned for the last-bit-aware TP_IDL pulse
+    bcu_ctrl 0x00
+    jmp tx_finish
+
+.org 0x240
+
+; RX hot loop.  rx_full has priority over rx_eop_done; when both are present
+; the final FCS byte is popped/stored before the end path runs.
+rx_poll:
+    bcu_stat r0
+    mov r2, r0
+    and r2, r3
+    jnz rx_byte
+    ldi8.l r2, 2
+    and r2, r0
+    jz rx_poll
+    jmp rx_end
+rx_byte:
+    bcu_rx r0
+    st_dmem_b r0, [r1]
+    inc r1
+    ldi8.l r2, 0x00
+    ldi8.h r2, 0x06        ; hard capture ceiling 0x600 (RLE boundary)
+    cmp r1, r2
+    jz rx_overrun
+    jmp rx_poll
+
+
+; ----------------------------------------------------------------------
+; TX completion: enforce 576 cycles IFG, optionally repeat the already built
+; stream, report completion, and return to interruptible idle/NLP operation.
+; ----------------------------------------------------------------------
+tx_finish:
+    set_anchor 0
+    ldi8.l r0, 0x40
+    ldi8.h r0, 0x02        ; 576 cycles = 9.6 us at 60 MHz
+    wait_phase r0
+
+    ldi8.l r2, 7
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    mov r0, r0
+    jz tx_no_repeat
+    dec r0
+    st_dmem_b r0, [r2]
+    jmp tx_playback_restart
+
+tx_no_repeat:
+    ; Clear the queued bit and set TX done without disturbing other status bits.
+    ldi8.l r2, 0
+    ldi8.h r2, 0
+    ldi8.l r0, 0
+    ldi8.h r0, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r2, 1
+    ld_dmem_b r0, [r2]
+    ldi8.l r3, 1
+    ldi8.h r3, 0
+    or r0, r3
+    st_dmem_b r0, [r2]
+    jmp tx_idle
+
+
+; ----------------------------------------------------------------------
+; RX completion and validation.  The CRC is frozen because both-low idle is
+; SE0 in differential mode and never enters the data/CRC path.
+; ----------------------------------------------------------------------
+rx_end:
+    bcu_ctrl 0x00          ; disarm; no timing-critical operation remains
+    ldi8.l r2, 0xe4
+    ldi8.h r2, 1
+    st_dmem_w r1, [r2]     ; capture end pointer
+
+    ; Validate the raw CRC-32 residue in software over frame+FCS bytes at
+    ; 0x10..capture_end.  The BCU CRC remains a hardware diagnostic, but the
+    ; input-synchronizer warmup phase is deliberately sacrificed before byte
+    ; alignment; software verification is relaxed-time and therefore exact.
+    ldi8.l r2, 0xe4
+    ldi8.h r2, 1
+    ld_dmem_w r0, [r2]
+    ldi8.l r2, 0x10
+    ldi8.h r2, 0
+    sub r0, r2             ; frame+FCS byte count
+    ldi8.l r2, 0xe0
+    ldi8.h r2, 1
+    st_dmem_w r0, [r2]
+    ldi8.l r0, 0x10
+    ldi8.h r0, 0
+    st_dmem_w r0, [r2+1]
+    ldi8.l r0, 0xff
+    ldi8.h r0, 0xff
+    ldi8.l r1, 0xff
+    ldi8.h r1, 0xff
+rx_crc_byte_loop:
+    ldi8.l r2, 0xe0
+    ldi8.h r2, 1
+    ld_dmem_w r3, [r2]
+    mov r3, r3
+    jz rx_crc_check
+    dec r3
+    st_dmem_w r3, [r2]
+    ld_dmem_w r3, [r2+1]
+    inc r3
+    st_dmem_w r3, [r2+1]
+    dec r3
+    ld_dmem_b r3, [r3]
+    xor r0, r3
+    call crc_nibble
+    call crc_nibble
+    jmp rx_crc_byte_loop
+rx_crc_check:
+    ldi8.l r2, 0xe3
+    ldi8.h r2, 0x20
+    cmp r0, r2
+    jnz rx_bad_crc
+    ldi8.l r2, 0xbb
+    ldi8.h r2, 0xde
+    cmp r1, r2
+    jnz rx_bad_crc
+
+    ; Validate the four aligned non-warmup 0x55 preamble octets at
+    ; 0x0b..0x0e and SFD 0xd5 at 0x0f.  The first two aligned preamble
+    ; bytes are sacrificed as deterministic icache warmup.
+    ldi8.l r1, 11
+    ldi8.h r1, 0
+    ldi8.l r3, 4
+    ldi8.h r3, 0
+rx_pre_check:
+    ld_dmem_b r0, [r1]
+    ldi8.l r2, 0x55
+    ldi8.h r2, 0
+    cmp r0, r2
+    jnz rx_bad_structure
+    inc r1
+    dec r3
+    jnz rx_pre_check
+    ld_dmem_b r0, [r1]
+    ldi8.l r2, 0xd5
+    cmp r0, r2
+    jnz rx_bad_structure
+
+    ; Length excluding FCS = capture_end - (stream base 0x08) - 8 pre/SFD - 4 FCS
+    ; = capture_end - 20.  Store it little-endian in mailbox bytes 4/5.
+    ldi8.l r2, 0xe4
+    ldi8.h r2, 1
+    ld_dmem_w r0, [r2]
+    ldi8.l r2, 20
+    ldi8.h r2, 0
+    sub r0, r2
+
+    ; Reject short frames (<60 frame octets before FCS) using bit15 wrap.
+    mov r1, r0
+    ldi8.l r2, 60
+    ldi8.h r2, 0
+    sub r1, r2
+    ldi8.l r2, 0x00
+    ldi8.h r2, 0x80
+    and r1, r2
+    jnz rx_bad_structure
+
+    ; Reject overlong frames (>1514) using the inverse subtraction wrap.
+    ldi8.l r2, 0xea
+    ldi8.h r2, 0x05        ; 1514
+    sub r2, r0
+    ldi8.l r3, 0x00
+    ldi8.h r3, 0x80
+    and r2, r3
+    jnz rx_bad_structure
+
+    ldi8.l r2, 4
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    mov r1, r0
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    ldi8.l r2, 5
+    st_dmem_b r1, [r2]
+
+    ; Status bit1 = RX valid, then wake core0 through EV_FLAGS[0].
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r3, 2
+    ldi8.h r3, 0
+    or r0, r3
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 1
+    ldi8.h r0, 0
+    csr_wr r0, 0x02        ; EV_SET bit0
+    halt
+
+rx_bad_crc:
+    ldi8.l r0, 0x20
+    jmp rx_store_bad
+rx_bad_structure:
+    ldi8.l r0, 0x10
+    jmp rx_store_bad
+rx_overrun:
+    bcu_ctrl 0x00
+    ldi8.l r0, 0x40
+rx_store_bad:
+    ldi8.h r0, 0
+    mov r3, r0
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    or r0, r3
+    st_dmem_b r0, [r2]
+    halt
+; CRC-32 reflected four-bit transform table, low/high slot pairs.
+.org 0x300
+crc_table:
+    .word 0x0000,0x0000, 0x1064,0x1db7, 0x20c8,0x3b6e, 0x30ac,0x26d9
+    .word 0x4190,0x76dc, 0x51f4,0x6b6b, 0x6158,0x4db2, 0x713c,0x5005
+    .word 0x8320,0xedb8, 0x9344,0xf00f, 0xa3e8,0xd6d6, 0xb38c,0xcb61
+    .word 0xc2b0,0x9b64, 0xd2d4,0x86d3, 0xe278,0xa00a, 0xf21c,0xbdbd
