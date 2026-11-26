@@ -63,6 +63,14 @@ register visibility (cores need only their own bank + few shared), share one
 read mux across ports with arbitration. Must preserve the CSR contract in
 docs/isa + ISS model + all firmware that reads CSRs (CORE_ID at 0xD!).
 
+## Negative results (dead levers, do not retry)
+
+- **SYNTH_STRATEGY AREA 3** (CI run 45835943761): mapped area DOUBLED to
+  2,076,990 um2, utilization 106.5%, GPL-0301 hard fail. AREA 3 replicates
+  logic for timing slack — smprather chose it for timing, not area. Default
+  strategy is already the area-minimal one. Synthesis knobs cannot fix this;
+  the mux/buffer structure is architectural.
+
 ## Levers, ranked by expected value
 
 1. **Mux-count reduction in RTL** — the real fix. The original audit flagged
