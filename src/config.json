@@ -53,10 +53,10 @@
 
   "//": "The SRAM has two supply rails (VDD!, VDDARRAY!) and one ground rail (VSS!).",
   "PDN_MACRO_CONNECTIONS": [
-    "i_sram0\\.i_sram VPWR VGND VDD! VSS!",
-    "i_sram0\\.i_sram VPWR VGND VDDARRAY! VSS!",
-    "i_sram1\\.i_sram VPWR VGND VDD! VSS!",
-    "i_sram1\\.i_sram VPWR VGND VDDARRAY! VSS!"
+    "u_arb0\\.i_sram\\.i_sram VPWR VGND VDD! VSS!",
+    "u_arb0\\.i_sram\\.i_sram VPWR VGND VDDARRAY! VSS!",
+    "u_arb1\\.i_sram\\.i_sram VPWR VGND VDD! VSS!",
+    "u_arb1\\.i_sram\\.i_sram VPWR VGND VDDARRAY! VSS!"
   ],
 
   "//": "PDN: Skip connecting the SRAMs by pdngen; they are powered by ExtendPowerStripes instead.",
