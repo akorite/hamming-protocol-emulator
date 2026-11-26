@@ -13,9 +13,12 @@
 ; Every index is therefore unique: prewarming leaves the loop, lead-in, and
 ; entry prologue simultaneously resident, and the real 10 MHz burst never
 ; misses in its steady loop.  The lead-in rewrites ctrl 0x01 after prewarm,
-; resetting RX/DPLL state while keeping TX armed; the clock entry arms RX at
-; the CPHA-appropriate edge.  CPHA=1 entries drive the first clock edge before
-; arming RX, making that edge the shift edge instead of reusing CPHA=0 timing.
+; resetting RX/DPLL state while keeping TX armed.  CPHA=1 entries drive only
+; the first shift edge; RX is then armed in the loop's first post-shift timing
+; slot.  That makes the free-running DPLL sample near the end of each MISO
+; cell, absorbing target output-delay plus the two-cycle input synchronizer,
+; without adding any clock-period padding.  Re-writing the same ctrl value in
+; later loop iterations is harmless because the arm is a level, not a rephase.
 ;
 .protocol spi_controller @clk 60MHz
 .bcu mode=nrz, stuff=off, transfer=8bits_msb_first, period=@baud(10000000)
@@ -197,7 +200,7 @@ spi_fast_m1_clock8:
     nop
 spi_fast_m1_clock8_second:
     pin_out 0x1, 0x0
-    nop
+    bcu_ctrl 0x03           ; first pass arms RX late in bit0's cell
     dec r1
     jnz spi_fast_m1_clock8
     ret
@@ -241,7 +244,7 @@ spi_fast_m3_clock8:
     nop
 spi_fast_m3_clock8_second:
     pin_out 0x1, 0x1
-    nop
+    bcu_ctrl 0x03           ; first pass arms RX late in bit0's cell
     dec r1
     jnz spi_fast_m3_clock8
     ret
@@ -267,7 +270,6 @@ spi_fast_m0_entry:
 spi_fast_m1_entry:
     ldi8.l r1, 8
     pin_out 0x1, 0x1
-    bcu_ctrl 0x03
     jmp spi_fast_m1_clock8_second
 
 .org 300
@@ -280,7 +282,6 @@ spi_fast_m2_entry:
 spi_fast_m3_entry:
     ldi8.l r1, 8
     pin_out 0x1, 0x0
-    bcu_ctrl 0x03
     jmp spi_fast_m3_clock8_second
 
 

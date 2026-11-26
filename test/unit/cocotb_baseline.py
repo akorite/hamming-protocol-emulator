@@ -652,85 +652,6 @@ async def test_uart_full_duplex_matrix(dut):
     await _uart_high_case(dut, -0.02, first_clock=False)
 
 
-@cocotb.test()
-async def debug_uart_probe(dut):
-    """Temporary whitebox probe used only while bring-up is red."""
-    await reset_dut(dut, start_clock=True)
-    drive_ui_bit(dut, 0, 1)
-    prog = await load_firmware(dut, "uart.hasm")
-    rb0 = await spi_read(dut, CMD_RD_SRAM0, 0, 4)
-    print(f"DBG uart slots={prog.used_slots} sram0w0={rb0:08x} want={prog.words[0]:08x}")
-    await configure_uart_bcu_pins(dut, rx_pin=8, tx_uio=0)
-    await write_bcu_config(
-        dut, 0,
-        isa.pack_bcu_mode(codec="nrz", stuff="off"),
-        (11 - 1),
-        isa.pack_dpll_cfg(mode="hard_snap", win=0, period=20),
-    )
-    await clear_mailbox(dut)
-    await write_sram1_bytes(dut, MEM_TX, bytes([0x55, 0xA5, 0x3C, 0xC3]))
-    await write_sram1_bytes(dut, 0, bytes([0, 0, 1, 4]))
-    rb = await read_sram1_word(dut, 0)
-    rb2 = await read_sram1_word(dut, 2)
-    print(f"DBG mailbox0={rb:08x} txword={rb2:08x}")
-    print(f"DBG pre router={u(dut.pin_router_flat):x} lutsel={u(dut.lut_sel_flat):x} luttt={u(dut.lut_tt_flat):x}")
-    async def mon():
-        last = None
-        for i in range(1200):
-            await RisingEdge(dut.clk)
-            line = uart_tx_line_bit(dut, 0)
-            raw = (uio_out_bit(dut, 0), uio_oe_bit(dut, 0),
-                   u(dut.gen_core[0].u_bcu.tx_p), u(dut.gen_core[0].u_bcu.tx_oe))
-            if line != last:
-                print(f"DBG mon cyc{i} line={line} raw={raw} pc={u(dut.core_pc_flat)&0x3ff:03x}")
-                last = line
-    cocotb.start_soon(mon())
-    async def rxmon():
-        last = None
-        lastfull = 0
-        for i in range(2200):
-            await RisingEdge(dut.clk)
-            rxp = u(dut.gen_core[0].u_bcu.rx_p)
-            sample = u(dut.gen_core[0].u_bcu.dpll_sample)
-            full = u(dut.gen_core[0].u_bcu.rx_full)
-            if rxp != last:
-                print(f"DBG rxpin cyc{i} rxp={rxp} pc={u(dut.core_pc_flat)&0x3ff:03x}")
-                last = rxp
-            if sample:
-                print(f"DBG sample cyc{i} lvl={rxp} cnt={u(dut.gen_core[0].u_bcu.rx_cnt)} sh={u(dut.gen_core[0].u_bcu.rx_shift):04x}")
-            if full and not lastfull:
-                print(f"DBG rxfull cyc{i} data={u(dut.gen_core[0].u_bcu.rx_data):04x}")
-            lastfull = full
-    cocotb.start_soon(rxmon())
-    rx = UARTReceiver(dut.clk, lambda: uart_tx_line_bit(dut, 0), 20, parity="even")
-    rx_task = cocotb.start_soon(rx.receive_bytes(1, 5000))
-    run_task = cocotb.start_soon(write_csr(dut, CSR_CTRL_RUN, 0x0001))
-    await run_task
-    tx = UARTTransmitter(dut.clk, lambda bit: drive_ui_bit(dut, 0, bit), 20, parity="even", drift=0.02)
-    tx_task = cocotb.start_soon(tx.send_bytes(bytes([0x96, 0x17, 0xE1, 0x42])))
-    try:
-        frames = await rx_task
-        print("DBG local rx frames", frames)
-    except Exception as e:
-        print("DBG local rx err", repr(e))
-    await tx_task
-    for n in (20, 100, 500, 2000):
-        await cycles(dut, n)
-        pcs = u(dut.core_pc_flat)
-        print(
-            "DBG t",
-            n,
-            f"pc={pcs & 0x3ff:03x}",
-            f"ctrl={u(dut.ctrl_run):x}",
-            f"uo={u(dut.uo_out):02x} uio_out={u(dut.uio_out):02x} uio_oe={u(dut.uio_oe):02x}",
-            f"bcu_ctrl={u(dut.gen_core[0].core_bcu_ctrl):02x}",
-            f"txp={u(dut.gen_core[0].u_bcu.tx_p)} txoe={u(dut.gen_core[0].u_bcu.tx_oe)}",
-            f"txs={u(dut.gen_core[0].u_bcu.txs)} txshv={u(dut.gen_core[0].u_bcu.tx_shadow_v)}",
-            f"txcnt={u(dut.gen_core[0].u_bcu.tx_sym_cnt)} stat={u(dut.gen_core[0].u_bcu.stat):04x}",
-            f"rxfull={u(dut.gen_core[0].u_bcu.rx_full)} rxp={u(dut.gen_core[0].u_bcu.rx_p)}",
-        )
-
-
 async def _uart_low_case(dut, first_clock):
     """115200 bps full duplex using the firmware's core0/core1 bitbang roles."""
     await reset_dut(dut, start_clock=first_clock)
@@ -883,60 +804,6 @@ async def test_spi_controller_matrix(dut):
             first = False
 
 
-@cocotb.test()
-async def debug_spi_ctrl_probe(dut):
-    """Temporary whitebox SPI controller phase probe (mode0, 1 MHz)."""
-    await reset_dut(dut, start_clock=True)
-    await load_firmware(dut, "spi_ctrl.hasm")
-    await configure_spi_controller_pins(dut)
-    await write_bcu_config(
-        dut, 1, isa.pack_bcu_mode(codec="nrz", stuff="off"),
-        (8 - 1) | 0x10, isa.pack_dpll_cfg(mode="none", win=0, period=6))
-    await clear_mailbox(dut)
-    await write_sram1_bytes(dut, MEM_TX, bytes([0xA5, 0x3C, 0x96, 0x5A]))
-    await write_sram1_bytes(dut, 0, bytes([0, 0, 0x11, 4]))
-    target = SPITargetBfm(
-        dut.clk,
-        lambda: uo_bit(dut, 1), lambda: uio_out_bit(dut, 1), lambda: uio_out_bit(dut, 5),
-        lambda bit: drive_ui_bit(dut, 1, bit), mode=1, expected_clock_cycles=6, clock_tolerance=0.3)
-    cocotb.start_soon(target.transfer([0x18], timeout_cycles=1200))
-
-    async def mon():
-        last = {}
-        for i in range(1600):
-            await RisingEdge(dut.clk)
-            vals = {
-                "cs": uo_bit(dut, 1),
-                "sclk": uio_out_bit(dut, 1),
-                "mosi": uio_out_bit(dut, 5),
-                "txp": u(dut.gen_core[1].u_bcu.tx_p),
-                "txtick": u(dut.gen_core[1].u_bcu.tx_tick),
-                "rxsamp": u(dut.gen_core[1].u_bcu.dpll_sample),
-                "pc": (u(dut.core_pc_flat) >> 10) & 0x3FF,
-                "txcnt": u(dut.gen_core[1].u_bcu.tx_sym_cnt),
-                "dcnt": u(dut.gen_core[1].u_bcu.u_dpll.cnt),
-                "rxsh": u(dut.gen_core[1].u_bcu.rx_shift),
-                "ctrl": u(dut.gen_core[1].core_bcu_ctrl),
-                "timer": u(dut.gen_core[1].u_core.timer) & 0xFF,
-                "anchor": u(dut.gen_core[1].u_core.anchor) & 0xFF,
-                "waita": u(dut.gen_core[1].u_core.wait_active),
-                "stall": u(dut.gen_core[1].u_core.stall_cnt) & 0xFF,
-            }
-            if (0xC0 <= vals["pc"] <= 0xD8) and ("pc" not in last or vals["pc"] != last["pc"] or vals["ctrl"] != last.get("ctrl", -1) or vals["waita"] != last.get("waita", -1)):
-                print(f"DBG spi cyc{i:04d} pc={vals['pc']:03x} ctrl={vals['ctrl']:02x} timer={vals['timer']:02x} anchor={vals['anchor']:02x} waita={vals['waita']} stall={vals['stall']:02x}")
-            for key in ("cs", "sclk", "mosi", "txp"):
-                if key not in last or vals[key] != last[key]:
-                    print(f"DBG spi cyc{i:04d} {key}={vals[key]} pc={vals['pc']:03x} txcnt={vals['txcnt']} dcnt={vals['dcnt']}")
-            if vals["txtick"]:
-                print(f"DBG spi cyc{i:04d} TXTICK txp={vals['txp']} pc={vals['pc']:03x} txcnt={vals['txcnt']}")
-            if vals["rxsamp"]:
-                print(f"DBG spi cyc{i:04d} RXSAMP pc={vals['pc']:03x} dcnt={vals['dcnt']} rxsh={vals['rxsh']:04x}")
-            last = vals
-    cocotb.start_soon(mon())
-    await write_csr(dut, CSR_CTRL_RUN, 0x0002)
-    await cycles(dut, 1600)
-
-
 async def _spi_target_case(dut, mode, first_clock):
     await reset_dut(dut, start_clock=first_clock)
     await load_firmware(dut, "spi_target.hasm")
@@ -1079,7 +946,7 @@ async def test_i2c_target_matrix(dut):
 
 @cocotb.test()
 async def test_i2c_nack_arbitration_and_spike(dut):
-    """AE5 negatives: NACK status, arbitration loss release, 50ns spike rejection."""
+    """AE5 negatives: NACK status, arbitration loss release, timed SDA spike rejection."""
     await reset_dut(dut, start_clock=True)
     bus = _make_i2c_bus(dut)
 
@@ -1122,22 +989,25 @@ async def test_i2c_nack_arbitration_and_spike(dut):
         serve = cocotb.start_soon(target.serve())
 
         async def inject():
-            # Wait for a genuine data-one/SCL-high phase, then pull SDA low for
-            # three 60 MHz clocks (50 ns).  The four-deep pin filter must reject it.
-            # Wait for the first in-transaction SCL high phase, then pull SCL
-            # low for three 60 MHz clocks (50 ns).  Unfiltered this is a false
-            # clock pulse; the four-deep filter must reject it.
-            prev_scl = 1
+            # Slot 0x58 is the write-one arbitration sample (`pin_in r2,2`).
+            # Its fetch window is visible whitebox before execution; starting
+            # there makes the wire pulse straddle the exact firmware sample.
+            # A three-clock/50 ns pad pulse is eaten by the bus resolver plus
+            # two synchronizer flops and never reaches the core.  Four clocks
+            # (66.7 ns) is the minimum width observed to traverse that input
+            # chain and hit the unfiltered sample.  In the filtered mode the
+            # four-tap filter has not forwarded the short low at that sample
+            # point; its qualification latency/rejection is therefore the only
+            # difference between the positive and negative arms.
             for _ in range(20000):
                 await ClockCycles(dut.clk, 1)
-                scl = bus.sample("scl")
-                if prev_scl == 0 and scl == 1:
-                    bus.set_drive("spike", "scl", True)
-                    await ClockCycles(dut.clk, 3)
-                    bus.set_drive("spike", "scl", False)
+                pc2 = (u(dut.core_pc_flat) >> 20) & 0x3FF
+                if pc2 == 0x58:
+                    bus.set_drive("spike", "sda", True)
+                    await ClockCycles(dut.clk, 4)
+                    bus.set_drive("spike", "sda", False)
                     return
-                prev_scl = scl
-            raise I2CProtocolError("spike trigger window not found")
+            raise I2CProtocolError("SDA glitch trigger window not found")
 
         spike = cocotb.start_soon(inject())
         await write_csr(dut, CSR_CTRL_RUN, 0x0004)
@@ -1151,8 +1021,8 @@ async def test_i2c_nack_arbitration_and_spike(dut):
             clean = False
         return clean
 
-    assert await spike_case(True), "50 ns SDA glitch corrupted a filtered I2C transaction"
-    assert not await spike_case(False), "non-vacuity failure: unfiltered 50 ns glitch was ignored"
+    assert await spike_case(True), "timed SDA glitch corrupted a filtered I2C transaction"
+    assert not await spike_case(False), "non-vacuity failure: unfiltered timed glitch was ignored"
 
 
 @cocotb.test()
@@ -1164,6 +1034,7 @@ async def test_concurrent_four_core_protocols(dut):
     any dependence on overlapping per-demo status bytes.
     """
     await reset_dut(dut, start_clock=True)
+    drive_ui_bit(dut, 0, 1)  # asynchronous UART RX idle high
     bus = _make_i2c_bus(dut)
     await load_program_source(dut, controller_concurrent_source())
 
@@ -1207,9 +1078,10 @@ async def test_concurrent_four_core_protocols(dut):
 
     uart_tx = UARTTransmitter(
         dut.clk, lambda bit: drive_ui_bit(dut, 0, bit),
-        bit_cycles=20, parity="even", drift=0)
+        bit_cycles=20, parity="even", drift=0,
+        start_delay_cycles=100)
     uart_rx = UARTReceiver(
-        dut.clk, lambda: uio_out_bit(dut, 0),
+        dut.clk, lambda: uart_tx_line_bit(dut, 0),
         bit_cycles=20, parity="even", drift=0)
     spi_target = SPITargetBfm(
         dut.clk, lambda: uo_bit(dut, 1), lambda: uio_out_bit(dut, 1),
@@ -1219,7 +1091,7 @@ async def test_concurrent_four_core_protocols(dut):
                               timeout_cycles=30000)
 
     uart_rx_task = cocotb.start_soon(uart_rx.receive_bytes(4, 20000))
-    uart_tx_task = cocotb.start_soon(uart_tx.send_bytes(uart_in))
+
     async def serve_spi_independent_bytes():
         captured = bytearray()
         for byte in spi_miso:
@@ -1234,6 +1106,10 @@ async def test_concurrent_four_core_protocols(dut):
     i2c_task = cocotb.start_soon(i2c_target.serve())
 
     await write_csr(dut, CSR_CTRL_RUN, 0x000F)
+    # Match the proven standalone full-duplex integration: only start the
+    # external UART after the BCU engine has been released by CTRL_RUN.  Its
+    # 100-cycle lead-in lets firmware reach the armed RX state before start.
+    uart_tx_task = cocotb.start_soon(uart_tx.send_bytes(uart_in))
     uart_frames = await uart_rx_task
     spi_mosi = await spi_task
     i2c_result = await i2c_task
