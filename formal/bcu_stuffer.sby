@@ -17,6 +17,7 @@ cover: depth 64
 
 [engines]
 smtbmc bitwuzla
+prove: abc pdr
 
 [script]
 read -formal bcu_stuffer_top.v hamming_bcu.v hamming_bcu_crc.v hamming_bcu_dpll.v
