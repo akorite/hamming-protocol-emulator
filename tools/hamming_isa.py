@@ -177,7 +177,7 @@ CORE_CSR = {
     "BCU_PAT_MATCH": 0xA,  # [15:0] pattern compared on rx_shift
     "BCU_PAT_LEN": 0xB,    # [3:0] match length
     "BCU_DPLL_CFG": 0xC,   # mode + symbol period
-    "BCU_TX_DATA": 0xD,
+    "CORE_ID": 0xD,       # read: reading core's index 0..3 (host reads bank index)
     "BCU_RX_DATA": 0xE,
     "BCU_STAT_SNAP": 0xF,  # read: BCU status snapshot
 }
@@ -1104,7 +1104,7 @@ def emit_docs():
         "BCU_PAT_MATCH": "16-bit pattern compared on rx_shift",
         "BCU_PAT_LEN": "pattern length",
         "BCU_DPLL_CFG": "DPLL mode + symbol period",
-        "BCU_TX_DATA": "TX shadow data",
+        "CORE_ID": "core index readback (was BCU_TX_DATA pre-U6)",
         "BCU_RX_DATA": "RX shadow data",
         "BCU_STAT_SNAP": "BCU status snapshot",
     }

@@ -503,6 +503,9 @@ class HammingISS:
             return self.timer & 0xFFFF
         if addr == isa.CSR["TIMER_HI"]:
             return (self.timer >> 16) & 0xF
+        if (isa.CSR_CORE_BANK <= addr < 0x80 and
+                (addr & 0xF) == isa.CORE_CSR["CORE_ID"]):
+            return self.core_id
         off = addr - (isa.CSR_CORE_BANK + 16 * self.core_id)
         if 0 <= off < 16:
             if off == isa.CORE_CSR["CORE_STATUS"]:
@@ -549,7 +552,7 @@ class HammingISS:
                 self.bcu.crc_poly = (self.bcu.crc_poly & 0xFFFF0000) | val
             elif off == isa.CORE_CSR["BCU_CRC_POLY_HI"]:
                 self.bcu.crc_poly = (self.bcu.crc_poly & 0xFFFF) | (val << 16)
-            if off != isa.CORE_CSR["BCU_TX_DATA"]:
+            if off != isa.CORE_CSR["CORE_ID"]:
                 self.csr[addr] = val
         # Writes outside the owned bank (other banks, LUT/router/global
         # config, read-only status) are dropped per the KTD11 ownership rule.

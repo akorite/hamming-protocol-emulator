@@ -169,7 +169,7 @@ module hamming_csr (
           4'hA: read_value = bcu_pat_match_r[read_bank];
           4'hB: read_value = {12'b0, bcu_pat_len_r[read_bank]};
           4'hC: read_value = {bcu_dpll_cfg_r[read_bank][13:2], 2'b00, bcu_dpll_cfg_r[read_bank][1:0]};
-          4'hD: read_value = 16'h0000;
+          4'hD: read_value = (read_port == 0) ? read_bank : (read_port - 1);
           4'hE: read_value = bcu_rx_data_flat[read_bank*16 +: 16];
           4'hF: read_value = bcu_stat_flat[read_bank*16 +: 16];
           default: read_value = 16'h0000;

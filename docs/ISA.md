@@ -183,7 +183,7 @@ writes outside the owned set are dropped.
 | 0xA | BCU_PAT_MATCH | 16-bit pattern compared on rx_shift |
 | 0xB | BCU_PAT_LEN | pattern length |
 | 0xC | BCU_DPLL_CFG | DPLL mode + symbol period |
-| 0xD | BCU_TX_DATA | TX shadow data |
+| 0xD | CORE_ID | core index readback (was BCU_TX_DATA pre-U6) |
 | 0xE | BCU_RX_DATA | RX shadow data |
 | 0xF | BCU_STAT_SNAP | BCU status snapshot |
 

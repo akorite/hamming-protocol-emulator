@@ -121,7 +121,7 @@
 `define HAM_CSR_BCU_PAT_MATCH        4'hA
 `define HAM_CSR_BCU_PAT_LEN          4'hB
 `define HAM_CSR_BCU_DPLL_CFG         4'hC
-`define HAM_CSR_BCU_TX_DATA          4'hD
+`define HAM_CSR_CORE_ID              4'hD
 `define HAM_CSR_BCU_RX_DATA          4'hE
 `define HAM_CSR_BCU_STAT_SNAP        4'hF
 
