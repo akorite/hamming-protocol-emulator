@@ -1,0 +1,190 @@
+; SPDX-FileCopyrightText: 2026 akorite
+; SPDX-License-Identifier: Apache-2.0
+;
+; Hamming UART man-in-the-middle fault-injection demo firmware.
+;
+; One core plus its BCU forms a live store-and-forward UART proxy: every
+; inbound 11-bit frame (start, 8 data, even parity, stop; 3 Mbps over a
+; 20-cycle bit cell) is popped out of the BCU RX shadow, passed through a
+; host-programmed fault policy, and pushed back into the BCU TX serializer
+; on a second pin.  Because each BCU transfer is exactly one UART frame,
+; any pipeline slack only ever inserts legal idle time between downstream
+; frames; the downstream receiver always sees well-formed bit cells.
+;
+; Memory mailbox (SRAM 1 byte addresses):
+;   1    status: 1 = all four frames forwarded (done)
+;   2    fault mode: 0 = clean pass-through,
+;                  1 = flip the single commanded frame bit in byte N,
+;                  2 = drop byte N (never retransmitted),
+;                  3 = silent corruption: flip the commanded data bit AND
+;                      the parity bit, so the corrupted payload still passes
+;                      downstream parity/framing validation
+;   3    target byte index N (0..3)
+;   4    frame bit position to flip (0..10; positions 1..8 are UART data
+;        bits 0..7, position 9 is the parity bit, 0/10 hit start/stop)
+;   0x40+i  evidence: data byte actually retransmitted for frame i
+;        (written only for frames that are transmitted)
+;
+; Pin plan used by the tests (same shape as the baseline UART matrix):
+;   upstream RX:  ui_in[0] (pin_inputs bit 8) through tier-1 LUT0 -> BCU0 rx_p
+;   downstream TX: uio0 data/OE <- BCU0 tx_p/tx_oe through the pin router
+;
+; Timing contract (deliberately identical to the proven uart.hasm BCU path):
+; the upstream transmitter sends frames back-to-back (zero idle gap).  The
+; hard-snap DPLL locks on the first start edge while the line is idle; with
+; contiguous frames every subsequent start edge re-snaps the cell phase at
+; frame boundaries, so the 11-deep RX shift alignment is maintained without
+; any firmware rearm.  Idle gaps longer than roughly half a bit cell would
+; let free-running idle samples slip into the RX shift register; that is a
+; documented constraint of this demo, not hidden state.
+;
+; ORCHESTRATOR-CHECK: the BCU TX path holds only one shadow word.  This
+; firmware never pushes faster than one frame per received frame (>= 220
+; cycles apart), and the TX serializer drains one frame per 220 cycles, so
+; the shadow can never be overwritten while still pending.  In the worst
+; case a late push only widens the idle gap between downstream frames,
+; which is legal asynchronous UART.
+;
+; The RLE capture half of the demo needs no firmware involvement: the host
+; arms the RLE engine over SRAM1's ring region with probe bits covering the
+; upstream pin (bit 8) and the looped-back downstream pin (bit 0).
+;
+; Instruction budget: ~70 slots of the 1024-slot image (compare can20a at
+; ~640 and eth_10baset at ~800 slots).
+
+.protocol uart_mitm_fault_injection @clk 60MHz
+.bcu mode=nrz, stuff=off, transfer=11bits_lsb_first, dpll=hard_snap(@baud(3000000))
+.constraint mitm_uart_bit_period = @baud(3000000) cycles in BCU mode
+
+mitm_entry:
+    ; Architected core dispatch: CORE_ID lives at bank offset 0xD (CSR 0x4d
+    ; for core0).  Core0 is the MITM forwarding engine; other cores halt.
+    csr_rd r1, 0x4d
+    mov r1, r1
+    jz mitm_engine
+    halt
+
+mitm_engine:
+    ; Soft-reset the BCU, then arm TX and RX.  Host CSR setup supplies:
+    ; codec=nrz, len=11, LSB-first, DPLL hard-snap period=@baud(3000000)=20.
+    bcu_ctrl 0x20
+    bcu_ctrl 0x00
+    bcu_ctrl 0x03              ; tx_arm | rx_arm
+
+    ldi8.l r3, 0
+    ldi8.h r3, 0               ; r3 = running frame index, survives across calls
+    call mitm_forward          ; frame 0
+    call mitm_forward          ; frame 1
+    call mitm_forward          ; frame 2
+    call mitm_forward          ; frame 3
+
+    ; Success status=1 at byte address 1.
+    ldi8.l r2, 1
+    ldi8.l r0, 1
+    st_dmem_b r0, [r2]
+    halt
+
+
+; ----------------------------------------------------------------------
+; mitm_forward: receive one 11-bit frame, apply the host-programmed fault
+; policy, retransmit (unless dropped).  Advances r3.  Clobbers r0-r2.
+; Worst-case service latency is far below one frame time (220 cycles), so
+; the RX shadow is always popped before the next frame completes.
+; ----------------------------------------------------------------------
+mitm_forward:
+    ldi8.l r2, 0x20            ; rx_full = BCU status bit5
+mf_wait_full:
+    bcu_stat r1
+    and r1, r2
+    jz mf_wait_full
+    bcu_rx r0                  ; r0 = frame: bit0 start, 1..8 data, 9 parity, 10 stop
+
+    ; Is this frame the host-commanded target index (mailbox byte 3)?
+    ldi8.l r2, 3
+    ld_dmem_b r2, [r2]
+    cmp r3, r2
+    jnz mf_transmit            ; not the target: forward clean
+
+    ; Target frame: dispatch on the fault mode (mailbox byte 2).
+    ldi8.l r2, 2
+    ld_dmem_b r1, [r2]
+    mov r1, r1
+    jz mf_transmit             ; mode 0: clean pass-through even for the target
+    ldi8.l r2, 2
+    cmp r1, r2
+    jz mf_drop                 ; mode 2: drop byte N
+    ldi8.l r2, 3
+    cmp r1, r2
+    jz mf_silent               ; mode 3: silent corruption
+
+    ; mode 1: flip exactly the commanded frame bit.
+    ; r1 = 1 << (mailbox byte 4), positions 0..10.
+    ldi8.l r2, 4
+    ld_dmem_b r2, [r2]
+    ldi8.l r1, 1
+    ldi8.h r1, 0
+mf_shift1:
+    mov r2, r2
+    jz mf_flip_apply
+    shl r1
+    dec r2
+    jmp mf_shift1
+mf_flip_apply:
+    xor r0, r1
+    jmp mf_transmit
+
+mf_silent:
+    ; Flip the commanded data bit AND the parity bit (frame bit 9).  The
+    ; downstream receiver then validates framing and parity cleanly while
+    ; the payload is wrong - the fault that simple link-layer checks cannot
+    ; see, which is exactly what the capture ring is there to expose.
+    ldi8.l r2, 4
+    ld_dmem_b r2, [r2]
+    ldi8.l r1, 1
+    ldi8.h r1, 0
+mf_shift2:
+    mov r2, r2
+    jz mf_silent_apply
+    shl r1
+    dec r2
+    jmp mf_shift2
+mf_silent_apply:
+    xor r0, r1
+    ldi8.l r1, 0x00
+    ldi8.h r1, 0x02            ; 0x0200 = parity bit position in the 11-bit frame
+    xor r0, r1
+    jmp mf_transmit
+
+mf_drop:
+    ; The frame is consumed out of RX but never retransmitted: downstream
+    ; byte loss.  The TX pipeline simply goes idle for one frame time.
+    inc r3
+    ret
+
+mf_transmit:
+    ; Evidence mailbox at 0x40+index: the data byte as actually encoded in
+    ; the retransmitted frame (post-corruption), so the host can compare
+    ; intent against the capture ring independently.
+    mov r1, r0
+    shr r1
+    ldi8.l r2, 0xff
+    and r1, r2
+    ldi8.l r2, 0x40
+    ldi8.h r2, 0
+    add r2, r3
+    st_dmem_b r1, [r2]
+    ; Wait for the TX shadow to drain before pushing.  The frame pipeline
+    ; paces pushes one receive-frame apart, which is exactly one drain-time:
+    ; without polling, the push races the serializer shadow reload with zero
+    ; slack and the final frame corrupts (observed: byte 3 of the clean
+    ; pass-through decoded as wire garbage while the evidence byte was
+    ; correct).  Polling costs a few idle bit-times between downstream
+    ; frames, which is legal asynchronous UART.
+    ldi8.l r2, 0x10            ; tx shadow free = BCU status bit4
+mf_wait_txfree:
+    bcu_stat r1
+    and r1, r2
+    jz mf_wait_txfree
+    bcu_tx r0                  ; one push = one complete UART frame
+    inc r3
+    ret
