@@ -195,3 +195,34 @@ def test_can20a_rx_rejects_bad_crc():
 
 def test_can20a_rx_detects_stuff_error():
     _run("test_can20a_rx_detects_stuff_error")
+
+
+# ----------------------------------------------------------------------
+# Chip-level USB FS/LS tests
+# ----------------------------------------------------------------------
+def test_usb_tx_token():
+    _run("test_usb_tx_token")
+
+
+def test_usb_rx_token():
+    _run("test_usb_rx_token")
+
+
+def test_usb_response_window():
+    _run("test_usb_response_window")
+
+
+def test_usb_crc5_err():
+    _run("test_usb_crc5_err")
+
+
+def test_usb_crc16_err():
+    _run("test_usb_crc16_err")
+
+
+def test_usb_stuff_err():
+    _run("test_usb_stuff_err")
+
+
+def test_usb_ls_smoke():
+    _run("test_usb_ls_smoke")

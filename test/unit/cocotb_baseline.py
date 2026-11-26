@@ -537,17 +537,36 @@ def pack_le_bytes(data, width_multiple=4):
 
 
 async def write_sram1_bytes(dut, byte_addr, data):
-    assert byte_addr % 4 == 0, "helper requires word-aligned byte address"
-    await write_sram1_words(dut, byte_addr // 4, pack_le_bytes(data))
+    """Byte-granular SRAM1 write; unaligned addresses go through read-modify-
+    write of the enclosing words.  Use only for host-side mailbox setup where
+    no concurrent firmware access to the affected words is in flight."""
+    data = list(data)
+    if byte_addr % 4 == 0:
+        await write_sram1_words(dut, byte_addr // 4, pack_le_bytes(data))
+        return
+    first_word = byte_addr // 4
+    last_word = (byte_addr + len(data) - 1) // 4
+    words = [await read_sram1_word(dut, w) for w in range(first_word, last_word + 1)]
+    flat = []
+    for w in words:
+        flat.extend((w >> (8 * lane)) & 0xFF for lane in range(4))
+    base = first_word * 4
+    for i, b in enumerate(data):
+        flat[byte_addr + i - base] = b & 0xFF
+    await write_sram1_words(dut, first_word, pack_le_bytes(flat))
 
 
 async def read_sram1_bytes(dut, byte_addr, count):
-    assert byte_addr % 4 == 0, "helper requires word-aligned byte address"
     out = []
-    for pos in range(0, count, 4):
-        word = await read_sram1_word(dut, byte_addr // 4 + pos // 4)
-        take = min(4, count - pos)
-        out.extend((word >> (8 * lane)) & 0xFF for lane in range(take))
+    pos = 0
+    while pos < count:
+        addr = byte_addr + pos
+        word = await read_sram1_word(dut, addr // 4)
+        lane = addr % 4
+        take = min(4 - lane, count - pos)
+        for i in range(take):
+            out.append((word >> (8 * (lane + i))) & 0xFF)
+        pos += take
     return bytes(out)
 
 
