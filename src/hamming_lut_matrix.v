@@ -55,6 +55,14 @@ module hamming_lut_matrix (
     output reg  [6:0]  uo_out
 );
 
+`ifdef FORMAL
+  // Shared formal timebase.  The first clock is constrained to be a reset
+  // clock; later reset activity is unconstrained so both reset and
+  // deselection behavior are part of the proof.
+  reg f_past_valid;
+  initial f_past_valid = 1'b0;
+`endif
+
   // ------------------------------------------------------------------------
   // Input synchronizers and per-uio-pin 4-tap glitch filters.  A filtered
   // output only changes when four consecutive samples agree, so spikes of
@@ -141,6 +149,22 @@ module hamming_lut_matrix (
           out_r <= lut_comb[gl];
       end
       assign lut_outputs[gl] = lut_oreg[gl] ? out_r : lut_comb[gl];
+
+`ifdef FORMAL
+      // The optional output register is a true one-cycle sample of the LUT
+      // combinational value.  When the register is not selected the leaf is
+      // combinational; when selected it can only carry the registered sample.
+      always @(posedge clk) begin
+        if (f_past_valid && rst_n) begin
+          if ($past(rst_n))
+            assert (out_r == $past(lut_comb[gl]));
+          if (!lut_oreg[gl])
+            assert (lut_outputs[gl] == lut_comb[gl]);
+          else
+            assert (lut_outputs[gl] == out_r);
+        end
+      end
+`endif
     end
   endgenerate
 
@@ -232,5 +256,68 @@ module hamming_lut_matrix (
         uo_out[ob] <= ch_out[16 + ob];
     end
   end
+
+`ifdef FORMAL
+  // One-cycle leaf-output witness.  ch_out and the configuration inputs are
+  // captured at the same edge as the output leaf registers.  On the next
+  // clock the visible outputs must exactly equal that sampled image.  This
+  // simultaneously proves the open-drain clamp, the ena deselection clamp,
+  // reset behavior, and safe replay exit (no replay value can leak beyond
+  // the single registered leaf stage).
+  reg [22:0] f_exp_ch_out;
+  reg [7:0]  f_exp_open_drain;
+  reg        f_exp_ena;
+  reg        f_exp_rst_n;
+  reg        f_exp_replay_active;
+  reg        f_exp_valid;
+
+  integer f_ob;
+  initial f_exp_valid = 1'b0;
+
+  always @(posedge clk) begin
+    f_past_valid <= 1'b1;
+    if (!f_past_valid)
+      assume (!rst_n);
+
+    f_exp_valid         <= 1'b1;
+    f_exp_ch_out        <= ch_out;
+    f_exp_open_drain    <= open_drain_en;
+    f_exp_ena           <= ena;
+    f_exp_rst_n         <= rst_n;
+    f_exp_replay_active <= replay_active;
+
+    if (f_exp_valid) begin
+      if (!f_exp_rst_n || !f_exp_ena) begin
+        assert (uio_out == 8'h00);
+        assert (uio_oe  == 8'h00);
+        assert (uo_out  == 7'h00);
+      end else begin
+        for (f_ob = 0; f_ob < 8; f_ob = f_ob + 1) begin
+          assert (uio_out[f_ob] == (f_exp_open_drain[f_ob] ? 1'b0 : f_exp_ch_out[f_ob]));
+          assert (uio_oe[f_ob]  == f_exp_ch_out[8 + f_ob]);
+          if (f_exp_open_drain[f_ob])
+            assert (uio_out[f_ob] == 1'b0);
+        end
+        for (f_ob = 0; f_ob < 7; f_ob = f_ob + 1)
+          assert (uo_out[f_ob] == f_exp_ch_out[16 + f_ob]);
+      end
+    end
+
+    if (f_past_valid) begin
+      // Activity and safety covers: registered pin activity, a logical-one
+      // router result clamped low by open-drain, replay deassertion after an
+      // enabled cycle, disabled-pin release, and registered LUT activity.
+      cover (f_exp_valid && f_exp_rst_n && f_exp_ena &&
+             (uio_out != 8'h00) && (uio_oe != 8'h00) && (uo_out != 7'h00));
+      cover (f_exp_valid && f_exp_rst_n && f_exp_ena &&
+             f_exp_open_drain[0] && f_exp_ch_out[0] && !uio_out[0]);
+      cover (f_exp_valid && f_exp_rst_n && f_exp_ena &&
+             f_exp_replay_active && !replay_active);
+      cover (f_exp_valid && f_exp_rst_n && !f_exp_ena &&
+             (uio_out == 8'h00) && (uio_oe == 8'h00) && (uo_out == 7'h00));
+      cover (rst_n && (lut_oreg != 16'h0000) && (lut_outputs != 16'h0000));
+    end
+  end
+`endif
 
 endmodule

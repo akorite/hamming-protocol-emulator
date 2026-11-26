@@ -471,6 +471,14 @@ module hamming_bcu (
                             end
                         end else if (!is_data && consume) begin
                             tx_stuff_pend <= 1'b0;
+                            // CAN/USB stuffing is defined on the physical
+                            // emitted stream: the inserted complement bit is
+                            // the first bit of the next run.  Seeding the
+                            // run counter here is essential for CAN; without
+                            // it five data bits equal to a prior stuff bit
+                            // could produce six equal bits on the wire.
+                            tx_run_cnt  <= 3'd1;
+                            tx_run_val  <= emit_bit;
                         end
 
                         // ---------------------------------------------
@@ -528,7 +536,13 @@ module hamming_bcu (
                             end
                         end
                         if (!codec_half || tx_half) begin
-                            tx_run_cnt <= 3'd0;
+                            // As in the mid-stream stuffing path, the
+                            // trailing stuff bit seeds the next physical-run
+                            // count even when the transfer ends immediately
+                            // afterwards (the count is reinitialized on the
+                            // next TXS_IDLE entry).
+                            tx_run_cnt <= 3'd1;
+                            tx_run_val <= ~tx_run_val;
                             if (tx_shadow_v) begin
                                 tx_shift     <= tx_shadow;
                                 tx_shadow_v  <= 1'b0;
@@ -636,9 +650,17 @@ module hamming_bcu (
                         rx_started <= 1'b1;
                         if (rx_skip) begin
                             // Dropping one stuff bit: it must be the
-                            // complement of the run value.
+                            // complement of the run value.  The dropped bit
+                            // nevertheless remains part of the physical wire
+                            // stream and seeds the next run, matching the
+                            // transmitter and the CAN five-bit wire rule.
                             rx_skip    <= 1'b0;
-                            rx_run_cnt <= 3'd0;
+                            if (stuff_mode == 2'd2) begin
+                                rx_run_cnt <= 3'd1;
+                                rx_run_val <= rbit;
+                            end else begin
+                                rx_run_cnt <= 3'd0;
+                            end
                             if (rbit == rx_run_val)
                                 st_stuff_err <= 1'b1;
                         end else begin
@@ -700,6 +722,171 @@ module hamming_bcu (
                 rx_full <= 1'b0;
         end
     end
+
+`ifdef FORMAL
+    // --------------------------------------------------------------------
+    // Formal bit-stuffing contract.  The logical emitted-bit stream is
+    // reconstructed at the same tick and half-cell phase at which the TX
+    // engine consumes a bit.  NRZ and NRZI are the codecs used by the CAN
+    // and USB stuffing profiles; Manchester-family codecs have a different
+    // line-level contract and are outside this particular invariant.
+    // --------------------------------------------------------------------
+    reg f_past_valid;
+    initial f_past_valid = 1'b0;
+
+    wire f_tx_control_clear = soft_rst_pulse || !ctl_tx_arm;
+    wire f_tx_run_event = tx_active && !f_tx_control_clear && tx_tick &&
+                          (txs == TXS_RUN) && (!codec_half || tx_half);
+    wire f_tx_tstuff_event = tx_active && !f_tx_control_clear && tx_tick &&
+                             (txs == TXS_TSTUFF) && (!codec_half || tx_half);
+    wire f_tx_bit_event = f_tx_run_event || f_tx_tstuff_event;
+    wire f_tx_bit_isstuff = (txs == TXS_TSTUFF) ||
+                            ((txs == TXS_RUN) && tx_stuff_pend);
+    wire f_tx_bit_value = f_tx_bit_isstuff ? ~tx_run_val : tx_next_bit;
+    wire f_tx_codec01 = (codec == 3'd0) || (codec == 3'd1);
+    wire f_tx_stream_active = tx_active &&
+                              ((txs == TXS_RUN) || (txs == TXS_TSTUFF));
+    wire f_tx_run_tracked = f_tx_codec01 &&
+        ((stuff_mode == 2'd2) ||
+         ((stuff_mode == 2'd1) && tx_run_val));
+    wire f_tx_stream_clear = f_tx_control_clear || !tx_active ||
+                             (txs == TXS_IDLE) || (txs == TXS_EOP);
+
+    reg       f_tx_last_valid;
+    reg       f_tx_last_bit;
+    reg [3:0] f_tx_run_len;
+
+    // The monitor state is asynchronous-reset only to match the DUT's reset
+    // discipline.  It carries no silicon cost because the whole block is
+    // excluded unless FORMAL is defined.
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            f_tx_last_valid <= 1'b0;
+            f_tx_last_bit   <= 1'b0;
+            f_tx_run_len    <= 4'd0;
+        end else if (f_tx_stream_clear) begin
+            f_tx_last_valid <= 1'b0;
+            f_tx_last_bit   <= 1'b0;
+            f_tx_run_len    <= 4'd0;
+        end else if (f_tx_bit_event) begin
+            f_tx_last_valid <= 1'b1;
+            f_tx_last_bit   <= f_tx_bit_value;
+            if (!f_tx_last_valid || (f_tx_bit_value != f_tx_last_bit))
+                f_tx_run_len <= 4'd1;
+            else
+                f_tx_run_len <= f_tx_run_len + 4'd1;
+        end
+    end
+
+    always @(posedge clk) begin
+        f_past_valid <= 1'b1;
+        if (!f_past_valid)
+            assume (!rst_n);
+
+        // Protocol configuration is quasi-static while a transmission is in
+        // progress.  It may be reprogrammed before arming or after idle, but
+        // switching the stuffing rule or transfer length mid-frame is outside
+        // the documented software contract.
+        if (f_past_valid && tx_active) begin
+            // tx_active is already high in the cycle preceding the first bit
+            // tick, so stability must include that activation edge rather
+            // than waiting for one additional bit period.
+            assume ($stable(cfg_mode));
+            assume ($stable(cfg_bit_len));
+        end
+
+        if (f_past_valid && rst_n) begin
+            // Basic state well-formedness lemmas.  Besides being useful
+            // safety assertions, they keep the induction step away from
+            // impossible bit-index states.
+            assert (txs <= TXS_EOP);
+            if (txs == TXS_RUN)
+                assert (tx_bits_left != 5'd0);
+
+            // Internal run-counter bounds implied by the two trigger rules:
+            // CAN resets on the fifth equal bit and USB on the sixth one.
+            if ((stuff_mode == 2'd2) && tx_active && f_tx_codec01)
+                assert (tx_run_cnt <= 3'd4);
+            if ((stuff_mode == 2'd1) && tx_active && tx_run_val && f_tx_codec01)
+                assert (tx_run_cnt <= 3'd5);
+
+            // Correlation lemmas between the physical-stream monitor and the
+            // implementation's run counter.  These are the key induction
+            // lemmas: without them k-induction may choose an unreachable
+            // state in which the two run-length representations disagree.
+            // A nonzero counter exactly counts the current logical run for
+            // CAN (both polarities) and for USB one-runs.  The counter is
+            // zero only before the first bit or in the trigger gap before
+            // the complement stuff bit.
+            if (f_tx_stream_active && f_tx_run_tracked &&
+                f_tx_last_valid && (tx_run_cnt != 3'd0)) begin
+                assert (tx_run_val == f_tx_last_bit);
+                assert ({1'b0, tx_run_cnt} == f_tx_run_len);
+            end
+
+            // In the trigger gap the pending/trailing stuff bit must still
+            // be the complement of the bit that closed the run.  Besides
+            // being a useful safety fact, this makes the stuff-bit transition
+            // in the correlation lemma inductive.
+            if (f_tx_stream_active && f_tx_codec01 &&
+                ((stuff_mode == 2'd1) || (stuff_mode == 2'd2)) &&
+                (tx_stuff_pend || (txs == TXS_TSTUFF))) begin
+                assert (f_tx_last_valid);
+                assert (f_tx_last_bit == tx_run_val);
+            end
+
+            // State-form bounds for the reconstructed logical stream.  USB
+            // permits at most six consecutive ones; CAN permits at most five
+            // consecutive equal bits of either polarity.  The stream-active
+            // guard avoids interpreting the monitor's one-cycle drained state
+            // after a frame as part of a newly reprogrammed following frame.
+            if ((stuff_mode == 2'd1) && f_tx_stream_active && f_tx_codec01 &&
+                f_tx_last_valid && f_tx_last_bit)
+                assert (f_tx_run_len <= 4'd6);
+            if ((stuff_mode == 2'd2) && f_tx_stream_active && f_tx_codec01 &&
+                f_tx_last_valid)
+                assert (f_tx_run_len <= 4'd5);
+
+            // Transition-form consequences: emitting one more identical bit
+            // may produce the sixth USB one or fifth CAN bit, but never the
+            // seventh/sixth respectively.  Thus a complement stuff bit must
+            // have been interposed immediately after the threshold bit.
+            if (f_tx_bit_event && f_tx_last_valid) begin
+                if ((stuff_mode == 2'd1) && f_tx_codec01 &&
+                    f_tx_bit_value && f_tx_last_bit)
+                    assert (f_tx_run_len < 4'd6);
+                if ((stuff_mode == 2'd2) && f_tx_codec01 &&
+                    (f_tx_bit_value == f_tx_last_bit))
+                    assert (f_tx_run_len < 4'd5);
+            end
+
+            // Software/soft reset and TX disarm really clear the stuffing
+            // machinery rather than leaving a pending stuff bit or stale run.
+            if ($past(rst_n) && $past(soft_rst_pulse || !ctl_tx_arm)) begin
+                assert (txs == TXS_IDLE);
+                assert (!tx_active);
+                assert (!tx_stuff_pend);
+                assert (tx_run_cnt == 3'd0);
+                assert (!tx_oe);
+            end
+
+            // Non-vacuity witnesses.  These require actual stuff insertion in
+            // both protocols, both CAN polarities, a trailing USB stuff bit,
+            // the largest legal USB run, and reset of a genuinely pending
+            // stuff state.
+            cover (f_tx_bit_event && (txs == TXS_RUN) && tx_stuff_pend &&
+                   (stuff_mode == 2'd1) && (codec == 3'd1));
+            cover ((txs == TXS_TSTUFF) && (stuff_mode == 2'd1));
+            cover (f_tx_bit_event && (txs == TXS_RUN) && tx_stuff_pend &&
+                   (stuff_mode == 2'd2) && !tx_run_val);
+            cover (f_tx_bit_event && (txs == TXS_RUN) && tx_stuff_pend &&
+                   (stuff_mode == 2'd2) && tx_run_val);
+            cover ((stuff_mode == 2'd1) && f_tx_codec01 &&
+                   f_tx_last_valid && f_tx_last_bit && (f_tx_run_len == 4'd6));
+            cover (soft_rst_pulse && tx_stuff_pend);
+        end
+    end
+`endif
 
 endmodule
 `default_nettype wire

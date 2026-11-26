@@ -571,6 +571,87 @@ module hamming_core #(
   // HAM_PIN_READ is the canonical LUT-read sub-op name in hamming_defs.vh.
   wire _unused_core_id = &{1'b0, CORE_ID};
 
+`ifdef FORMAL
+  // ------------------------------------------------------------------------
+  // Formal deadline-scheduling contract.  The dedicated deadline_sched
+  // harness supplies the architectural timer contract (one increment per
+  // clock) and keeps run asserted; those are environment facts, not logic
+  // assumptions baked into the silicon.  Given that contract, the key
+  // inductive invariant is that an active wait can only be in the negative
+  // signed20 half-range or exactly at zero.  Positive overshoot is
+  // unreachable because a unit-incrementing modular timer cannot jump from
+  // the negative half-range past zero.
+  // ------------------------------------------------------------------------
+  reg f_past_valid;
+  initial f_past_valid = 1'b0;
+
+  wire f_wait_phase_exec = exec_valid && instr_legal &&
+      (major == `HAM_MAJOR_TIMING) &&
+      ((sub == `HAM_TIM_WAIT_PHASE_RS) || (sub == `HAM_TIM_WAIT_PHASE_IMM));
+
+  always @(posedge clk) begin
+    f_past_valid <= 1'b1;
+    if (!f_past_valid)
+      assume (!rst_n);
+
+    // No positive overshoot state is architecturally visible while a WAIT is
+    // active.  Zero is precisely on time and is released at this clock edge.
+    if (f_past_valid && rst_n && wait_active && run && !halted_r)
+      assert (wait_cur_diff[19] || (wait_cur_diff == 20'h00000));
+
+    if (f_past_valid && rst_n && $past(rst_n)) begin
+      // Issuing a future deadline captures that exact modular deadline and
+      // enters the wait state.  It cannot set deadline_missed when the flag
+      // was clear: sign-bit one is exactly the sufficient-slack precondition.
+      if ($past(f_wait_phase_exec && wait_new_diff[19])) begin
+        assert (wait_active);
+        assert (stall_cnt == $past(wait_new_deadline));
+        if (!$past(deadline_missed))
+          assert (!deadline_missed);
+      end
+
+      // A strictly past deadline at issue is the overshoot case and sets the
+      // sticky flag without entering the wait state.
+      if ($past(f_wait_phase_exec && !wait_new_diff[19] &&
+                (wait_new_diff != 20'h00000))) begin
+        assert (deadline_missed);
+        assert (!wait_active);
+      end
+
+      // Equality is exactly on time: no stall and no newly-created miss.
+      if ($past(f_wait_phase_exec && (wait_new_diff == 20'h00000))) begin
+        assert (!wait_active);
+        if (!$past(deadline_missed))
+          assert (!deadline_missed);
+      end
+
+      // The miss flag has no architectural clear other than reset.
+      if ($past(deadline_missed))
+        assert (deadline_missed);
+
+      // Exact release: the first state sampled at the deadline (zero modular
+      // difference) leaves WAIT at that clock edge.  The overshoot invariant
+      // above rules out a positive-difference release before this point.
+      if ($past(wait_active && run && !halted_r && (wait_cur_diff == 20'h00000)))
+        assert (!wait_active);
+    end
+
+    if (f_past_valid && rst_n) begin
+      // Non-vacuity covers.  Separate cover witnesses may choose different
+      // fixed harness deltas: a small delta reaches exact release quickly,
+      // zero demonstrates sticky overshoot, and 16'hffff is the largest
+      // delta encodable by the actual RTL instruction formats.  The final
+      // cover also requires modular wraparound of the computed deadline.
+      cover (wait_active);
+      cover (wait_active && (wait_cur_diff == 20'h00000));
+      cover (deadline_missed);
+      cover (f_wait_phase_exec && (wait_delta == 20'h0ffff));
+      cover (f_wait_phase_exec && (wait_delta == 20'h0ffff) &&
+             (wait_new_deadline < anchor));
+    end
+  end
+`endif
+
 endmodule
 
 

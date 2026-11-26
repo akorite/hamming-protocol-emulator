@@ -118,5 +118,105 @@ module hamming_bcu_dpll (
         end
     end
 
+`ifdef FORMAL
+    // --------------------------------------------------------------------
+    // Modular formal contract.  The DPLL configuration is a quasi-static CSR
+    // setting: it may change while RX is disarmed, but not cycle-to-cycle
+    // while the recovery engine remains armed.  This is the same software
+    // discipline documented for the BCU CSR bank.
+    // --------------------------------------------------------------------
+    reg f_past_valid;
+    initial f_past_valid = 1'b0;
+
+    always @(posedge clk) begin
+        f_past_valid <= 1'b1;
+        if (!f_past_valid)
+            assume (!rst_n);
+
+        if (f_past_valid && $past(run)) begin
+            // The edge on which run falls still belongs to the previous
+            // armed configuration: registered sample/cell strobes visible in
+            // that cycle were generated from it.  Software may reprogram the
+            // CSR once one full disarmed clock has elapsed.
+            assume ($stable(cfg_mode));
+            assume ($stable(cfg_win));
+            assume ($stable(cfg_period));
+        end
+
+        if (f_past_valid && rst_n) begin
+            // Phase counter range is the central safety invariant.  With a
+            // stable nonzero encoded period it makes both the center and end
+            // comparisons exact and prevents wraparound/overflow artifacts.
+            assert (cnt < period);
+            if (half != 9'd0)
+                assert (half_cnt < half);
+
+            // The registered sample strobe marks the center crossing: in the
+            // cycle in which it is visible the cell counter is exactly half.
+            // Since an accepted edge forces cnt to zero, hard-snap therefore
+            // places the first post-edge sample half a cell after that edge.
+            if (sample) begin
+                assert (cnt == half);
+                assert (!cell_end);
+                if (cfg_mode != 2'd0)
+                    assert (locked);
+            end
+            if (cell_end)
+                assert (cnt == 9'd0);
+
+            // EOF is emitted only on the half-cell tick that increments the
+            // miss count from eight to nine.  It is a one-shot cause/effect
+            // relation, not merely a level association.
+            if (eof) begin
+                assert (miss_cnt == 4'd9);
+                assert (!$past(edge_in));
+                assert ($past(miss_cnt) == 4'd8);
+                assert ($past(half_cnt) == (half - 9'd1));
+            end
+
+            // Any observed edge_in proves line activity and restarts miss
+            // accumulation, whether or not the edge_in is accepted for phase
+            // correction.  An accepted edge_in also hard-resets the cell phase
+            // and establishes lock.
+            if ($past(rst_n) && $past(edge_in)) begin
+                assert (miss_cnt == 4'd0);
+                assert (half_cnt == 9'd0);
+            end
+            if ($past(rst_n) && $past(run && accept_edge)) begin
+                assert (cnt == 9'd0);
+                assert (locked);
+            end
+            if ($past(rst_n) && $past(run && edge_in &&
+                                          (cfg_mode == 2'd2) && !in_window && !locked))
+                assert (!locked);
+
+            // Documented edge_in acceptance profile.  Mode 0 ignores edges,
+            // hard-snap accepts every edge_in, and hold-off accepts exactly
+            // the configured boundary window.
+            if (edge_in) begin
+                if (cfg_mode == 2'd0)
+                    assert (!accept_edge);
+                if (cfg_mode == 2'd1)
+                    assert (accept_edge);
+                if (cfg_mode == 2'd2)
+                    assert (accept_edge == in_window);
+            end
+        end
+
+        if (f_past_valid && rst_n) begin
+            // Non-vacuity: each recovery profile can produce samples, EOF is
+            // reachable, and both sides of the hold-off acceptance window are
+            // reachable.  Cover mode may choose a short constant period, so
+            // these do not require a deep worst-case 256-cycle witness.
+            cover (sample && (cfg_mode == 2'd0));
+            cover (sample && (cfg_mode == 2'd1) && locked);
+            cover (sample && (cfg_mode == 2'd2) && locked);
+            cover (eof);
+            cover (run && edge_in && (cfg_mode == 2'd2) && in_window);
+            cover (run && edge_in && (cfg_mode == 2'd2) && !in_window);
+        end
+    end
+`endif
+
 endmodule
 `default_nettype wire

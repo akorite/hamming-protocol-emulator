@@ -149,4 +149,122 @@ module hamming_sram_arb #(
       .dout(dout)
   );
 
+`ifdef FORMAL
+  // ------------------------------------------------------------
+  // Modular formal contract (SymbiYosys only; no silicon logic).
+  // ------------------------------------------------------------
+  reg f_past_valid;
+  initial f_past_valid = 1'b0;
+
+  // Exact response monitor.  A read present on the request/grant interface
+  // at the accepting edge appears as rvalid three accepting edges later.
+  // In the state-transition encoding used by yosys-smtbmc that is the
+  // fourth state after the input state, hence the four-stage witness.
+  wire [NCLIENTS-1:0] f_read_grant = grant & ~we;
+  reg  [NCLIENTS-1:0] f_read_m1;
+  reg  [NCLIENTS-1:0] f_read_m2;
+  reg  [NCLIENTS-1:0] f_read_m3;
+  reg  [NCLIENTS-1:0] f_read_m4;
+  wire [NCLIENTS-1:0] f_delayed_grant;
+
+  always @(posedge clk) begin
+    f_past_valid <= 1'b1;
+    if (!f_past_valid)
+      assume (!rst_n);
+
+    if (!rst_n) begin
+      f_read_m1 <= {NCLIENTS{1'b0}};
+      f_read_m2 <= {NCLIENTS{1'b0}};
+      f_read_m3 <= {NCLIENTS{1'b0}};
+      f_read_m4 <= {NCLIENTS{1'b0}};
+    end else begin
+      f_read_m1 <= f_read_grant;
+      f_read_m2 <= f_read_m1;
+      f_read_m3 <= f_read_m2;
+      f_read_m4 <= f_read_m3;
+    end
+
+    if (f_past_valid) begin
+      // Structural grant contract: at most one client, never a grant
+      // without a same-cycle request, and a grant for exactly one client
+      // whenever any request is present (initiation interval one).
+      assert (rr_base < NCLIENTS);
+      assert (found == (|req));
+      assert ((grant & (grant - {{(NCLIENTS-1){1'b0}}, 1'b1})) == {NCLIENTS{1'b0}});
+      if (found) begin
+        assert (req[sel]);
+        assert (grant[sel]);
+      end else begin
+        assert (grant == {NCLIENTS{1'b0}});
+      end
+
+      // The macro port is a single registered owner: read and write are
+      // never simultaneously requested, and write_commit is precisely the
+      // delayed macro write edge.
+      assert (!(men_r && wen_r && ren_r));
+      if ($past(rst_n)) begin
+        assert (write_commit == ($past(men_r) && $past(wen_r)));
+        assert (v1 == $past(v0));
+        assert (v2 == $past(v1));
+        assert (id1 == $past(id0));
+        assert (id2 == $past(id1));
+      end
+
+      // Exact, non-stale read response: rvalid is the acceptance vector
+      // delayed by the documented three accepting edges and is otherwise
+      // empty.  Because the acceptance vector is one-hot, so is rvalid.
+      assert (rvalid == f_read_m4);
+      assert ((rvalid & (rvalid - {{(NCLIENTS-1){1'b0}}, 1'b1})) == {NCLIENTS{1'b0}});
+
+      // Non-vacuity and reset-space covers.  The re-reset covers require a
+      // prior high reset sample, so the cover task cannot satisfy them with
+      // only the mandatory initial reset cycle.
+      cover (rst_n && (&req));
+      cover (|rvalid);
+      cover (write_commit);
+      cover ($past(rst_n) && !rst_n && (v0 || v1 || v2));
+      cover ($past(rst_n) && !rst_n && !(v0 || v1 || v2) && !write_commit);
+      cover (|f_delayed_grant);
+    end
+  end
+
+  // Per-client bounded-response proof.  f_dist is the cyclic distance from
+  // rr_base to this client.  The key inductive invariant is
+  //     consecutive_denials + cyclic_distance <= NCLIENTS-1.
+  // Every cycle in which this client is skipped grants a client ahead of it,
+  // moving rr_base beyond that grant and strictly decreasing the distance.
+  // When the distance reaches zero the combinational scan necessarily grants
+  // this client.  Thus a continuously asserted request is accepted after at
+  // most NCLIENTS-1 intervening grants (within NCLIENTS accepting edges).
+  genvar fg;
+  generate
+    for (fg = 0; fg < NCLIENTS; fg = fg + 1) begin : gen_formal_client
+      wire [31:0] f_dist = (fg >= rr_base) ?
+                           (32'd0 + fg - rr_base) :
+                           (32'd0 + fg + NCLIENTS - rr_base);
+      reg [3:0] f_wait_cnt;
+
+      assign f_delayed_grant[fg] = req[fg] && grant[fg] && (f_wait_cnt != 4'd0);
+
+      always @(posedge clk) begin
+        if (!rst_n)
+          f_wait_cnt <= 4'd0;
+        else if (!req[fg] || grant[fg])
+          f_wait_cnt <= 4'd0;
+        else if (f_wait_cnt != 4'hf)
+          f_wait_cnt <= f_wait_cnt + 4'd1;
+
+        if (f_past_valid && rst_n) begin
+          assert (f_wait_cnt <= (NCLIENTS-1));
+          assert (({28'd0, f_wait_cnt} + f_dist) <= (NCLIENTS-1));
+          if (req[fg] && (f_dist == 32'd0))
+            assert (grant[fg]);
+          if (grant[fg])
+            assert (req[fg]);
+        end
+      end
+    end
+  endgenerate
+`endif
+
 endmodule
