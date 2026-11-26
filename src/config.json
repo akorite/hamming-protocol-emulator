@@ -7,6 +7,10 @@
   "//": "PL_TARGET_DENSITY_PCT - 58% post-CTS placement budget for the full design.",
   "PL_TARGET_DENSITY_PCT": 58,
 
+  "//synth": "AREA 3 max area optimisation (smprather reference); default strategy left",
+  "//synth2": "28k sg13cmos5l_buf_1 cells in the mapped netlist, over half of all logic.",
+  "SYNTH_STRATEGY": "AREA 3",
+
   "//pad": "Cell padding from the proven prism reference (same SRAMs, taped out): without",
   "//pad2": "DPL_CELL_PADDING the cmos5l cells pack too tight for detailed placement to",
   "//pad3": "legalize (DPL-0036 on ~106 instances near the SRAMs in the first hardening runs).",
