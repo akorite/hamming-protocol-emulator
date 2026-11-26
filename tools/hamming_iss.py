@@ -552,6 +552,14 @@ class HammingISS:
                 self.bcu.crc_poly = (self.bcu.crc_poly & 0xFFFF0000) | val
             elif off == isa.CORE_CSR["BCU_CRC_POLY_HI"]:
                 self.bcu.crc_poly = (self.bcu.crc_poly & 0xFFFF) | (val << 16)
+            # RTL write-side width narrowing (src/hamming_csr.v write_private):
+            # the silicon truncates these CSRs, so the model must too.
+            if off == isa.CORE_CSR["BCU_BIT_LEN"]:
+                val &= 0x1F
+            elif off == isa.CORE_CSR["BCU_PAT_LEN"]:
+                val &= 0xF
+            elif off == isa.CORE_CSR["BCU_DPLL_CFG"]:
+                val &= ~0xC & 0xFFFF
             if off != isa.CORE_CSR["CORE_ID"]:
                 self.csr[addr] = val
         # Writes outside the owned bank (other banks, LUT/router/global
