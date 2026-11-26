@@ -1,0 +1,176 @@
+; SPDX-FileCopyrightText: 2026 akorite
+; SPDX-License-Identifier: Apache-2.0
+;
+; Hamming baseline I2C target firmware, fixed address 0x42, two-byte demo.
+; Pins match i2c_ctrl.hasm (SDA=uio2 bit0, SCL=uio6 bit1, OE-only open drain).
+; Mailbox: byte1 status, bytes8..9 read-mode TX data, 0x40..41 write-mode RX.
+; Byte2 bit0 requests a 20 us clock stretch after the first data-byte ACK.
+;
+.protocol i2c_target @clk 60MHz
+.constraint target_clock_stretch = @us(20) cycles when enabled
+
+i2c_target_entry:
+    pin_out 0x3, 0x0
+    pin_oe 0x3, 0x0
+
+    ; Detect START: SDA high-to-low while SCL is high.  The polling loop is
+    ; several hundred times faster than the slowest supported SCL edge.
+i2c_tgt_idle_high:
+    pin_in r0, 2
+    mov r0, r0
+    jz i2c_tgt_idle_high
+i2c_tgt_start_poll:
+    pin_in r0, 2
+    mov r0, r0
+    jnz i2c_tgt_start_poll
+    pin_in r1, 6
+    mov r1, r1
+    jz i2c_tgt_idle_high         ; SDA fell while SCL low: not START
+
+    ; START is complete only after the controller pulls SCL low.  Without
+    ; this wait the still-high START phase is mistaken for the first bit.
+i2c_tgt_start_scl_low:
+    pin_in r1, 6
+    mov r1, r1
+    jnz i2c_tgt_start_scl_low
+
+    ; Receive address+R/W byte.
+    call i2c_tgt_rx_byte
+    mov r1, r0
+    ldi8.l r2, 0x84             ; address 0x42, write bit0=0
+    cmp r1, r2
+    jz i2c_tgt_is_write
+    ldi8.l r2, 0x85             ; address 0x42, read bit0=1
+    cmp r1, r2
+    jz i2c_tgt_is_read
+    halt                        ; not-for-us: remain released (a NACK)
+
+; ----------------------------------------------------------------------
+; Controller-write transaction: receive two bytes and ACK both.
+; ----------------------------------------------------------------------
+i2c_tgt_is_write:
+    call i2c_tgt_send_ack
+    call i2c_tgt_rx_byte
+    ldi8.l r2, 0x40
+    st_dmem_b r0, [r2]
+    call i2c_tgt_send_ack_stretchopt
+    call i2c_tgt_rx_byte
+    ldi8.l r2, 0x41
+    st_dmem_b r0, [r2]
+    call i2c_tgt_send_ack
+    jmp i2c_tgt_done
+
+; ----------------------------------------------------------------------
+; Controller-read transaction: transmit bytes8 and9, observe ACK/NACK.
+; ----------------------------------------------------------------------
+i2c_tgt_is_read:
+    call i2c_tgt_send_ack
+    ldi8.l r2, 8
+    ld_dmem_b r0, [r2]
+    call i2c_tgt_tx_byte
+    call i2c_tgt_read_ack
+    ldi8.l r2, 9
+    ld_dmem_b r0, [r2]
+    call i2c_tgt_tx_byte
+    call i2c_tgt_read_ack
+
+i2c_tgt_done:
+    pin_oe 0x3, 0x0
+    ldi8.l r2, 1
+    ldi8.l r0, 1
+    st_dmem_b r0, [r2]
+    halt
+
+
+; Receive a byte MSB-first into r0.  Waits for both clock phases on every bit.
+i2c_tgt_rx_byte:
+    ldi8.l r0, 0
+    ldi8.l r1, 8
+i2c_tgt_rx_loop:
+    shl r0
+i2c_tgt_rx_wh:
+    pin_in r2, 6
+    mov r2, r2
+    jz i2c_tgt_rx_wh
+    pin_in r2, 2
+    or r0, r2
+i2c_tgt_rx_wl:
+    pin_in r2, 6
+    mov r2, r2
+    jnz i2c_tgt_rx_wl
+    dec r1
+    jnz i2c_tgt_rx_loop
+    ret
+
+
+; ACK with no stretching (entered in the SCL-low phase after bit8).
+i2c_tgt_send_ack:
+    pin_oe 0x3, 0x1             ; pull SDA low, leave SCL undriven
+i2c_tgt_ack_wh:
+    pin_in r2, 6
+    mov r2, r2
+    jz i2c_tgt_ack_wh
+i2c_tgt_ack_wl:
+    pin_in r2, 6
+    mov r2, r2
+    jnz i2c_tgt_ack_wl
+    pin_oe 0x3, 0x0
+    ret
+
+
+; ACK with optional 20 us stretch selected by mailbox byte2 bit0.
+i2c_tgt_send_ack_stretchopt:
+    ldi8.l r2, 2
+    ld_dmem_b r1, [r2]
+    mov r1, r1
+    jz i2c_tgt_send_ack
+    pin_oe 0x3, 0x3             ; hold both SDA ACK and SCL low
+    ldi8.l r3, 0xb0           ; 1200 cycles = 20 us at 60 MHz (0x04b0)
+    ldi8.h r3, 0x04
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x1             ; release SCL, still ACKing SDA
+    jmp i2c_tgt_ack_wh
+
+
+; Transmit byte r0 MSB-first.  Data changes only while SCL is low.
+i2c_tgt_tx_byte:
+    ldi8.l r1, 8
+i2c_tgt_tx_loop:
+    ldi8.l r2, 0x80
+    and r2, r0
+    jz i2c_tgt_tx_zero
+    pin_oe 0x3, 0x0             ; logic one = release SDA
+    jmp i2c_tgt_tx_wait
+i2c_tgt_tx_zero:
+    pin_oe 0x3, 0x1             ; logic zero = pull SDA low
+i2c_tgt_tx_wait:
+i2c_tgt_tx_wh:
+    pin_in r2, 6
+    mov r2, r2
+    jz i2c_tgt_tx_wh
+i2c_tgt_tx_wl:
+    pin_in r2, 6
+    mov r2, r2
+    jnz i2c_tgt_tx_wl
+    shl r0
+    dec r1
+    jnz i2c_tgt_tx_loop
+    pin_oe 0x3, 0x0
+    ret
+
+
+; Release SDA and observe the controller's ninth-bit ACK.  Result is unused
+; by the fixed two-byte demo but is consumed so the line turnaround is correct.
+i2c_tgt_read_ack:
+    pin_oe 0x3, 0x0
+i2c_tgt_rack_wh:
+    pin_in r2, 6
+    mov r2, r2
+    jz i2c_tgt_rack_wh
+    pin_in r2, 2
+i2c_tgt_rack_wl:
+    pin_in r2, 6
+    mov r2, r2
+    jnz i2c_tgt_rack_wl
+    ret

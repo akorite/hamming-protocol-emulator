@@ -1,0 +1,88 @@
+; SPDX-FileCopyrightText: 2026 akorite
+; SPDX-License-Identifier: Apache-2.0
+;
+; Hamming baseline SPI target firmware using the BCU external-SCLK shift mode.
+;
+; Mailbox: byte1 status, bytes8..11 four MISO TX bytes, bytes0x40..43 MOSI RX.
+; Pin plan (core3): MISO=uio3, SCLK=uio4, CS_N=uio5, MOSI=uio6.
+;
+; KTD4 fabric contract used here:
+;   * BCU3 codec is nrz_extclk, 8 bits, MSB-first.
+;   * LUT6 passes MOSI to rx_p.
+;   * LUT7 computes (possibly inverted SCLK) OR CS_N.  Besides selecting the
+;     correct sampling polarity for modes 0-3, the OR gate creates a falling
+;     external-clock edge at CS_N assertion in the CPHA=0 modes.  That edge
+;     preloads the first MISO bit before the first controller sampling edge.
+;   * pin_filt_en must be zero for these pins (the focused test configures it).
+;
+.protocol spi_target @clk 60MHz
+.bcu mode=nrz_extclk, stuff=off, transfer=8bits_msb_first, external_sclk=pin_lut7
+.constraint spi_target_rate <= 5MHz with pin_filt_en=0
+
+spi_target_entry:
+    ; Reset and arm both directions.  TX is armed internally before CS while
+    ; the pad OE remains released; this is what makes CPHA=0 preload possible.
+    bcu_ctrl 0x20
+    bcu_ctrl 0x00
+    bcu_ctrl 0x03
+
+    ; Prime byte0 directly into the serializer and byte1 into the one-deep
+    ; shadow so back-to-back 5 MHz bytes need no real-time software work at
+    ; the inter-byte boundary.
+    ldi8.l r3, 8
+    ld_dmem_b r0, [r3]
+    bcu_tx r0
+    ldi8.l r3, 9
+    ld_dmem_b r0, [r3]
+    bcu_tx r0
+
+    ; Wait for CS_N low on uio5, then enable the MISO pad (core_oe bit0).
+spi_tgt_wait_cs_low:
+    pin_in r0, 5
+    mov r0, r0
+    jnz spi_tgt_wait_cs_low
+    pin_oe 0x1, 0x1
+
+    ; Byte0/1 are already queued.  Service RX0, then queue TX2.
+    ldi8.l r3, 0x40
+    call spi_tgt_rx_one
+    ldi8.l r3, 10
+    ld_dmem_b r0, [r3]
+    bcu_tx r0
+
+    ; Service RX1, then queue TX3.
+    ldi8.l r3, 0x41
+    call spi_tgt_rx_one
+    ldi8.l r3, 11
+    ld_dmem_b r0, [r3]
+    bcu_tx r0
+
+    ; Service the final two RX bytes; no further TX data is needed.
+    ldi8.l r3, 0x42
+    call spi_tgt_rx_one
+    ldi8.l r3, 0x43
+    call spi_tgt_rx_one
+
+    ; Wait for CS_N release, tri-state MISO, disarm the shifter, report done.
+spi_tgt_wait_cs_high:
+    pin_in r0, 5
+    mov r0, r0
+    jz spi_tgt_wait_cs_high
+    pin_oe 0x1, 0x0
+    bcu_ctrl 0x00
+    ldi8.l r3, 1
+    ldi8.l r0, 1
+    st_dmem_b r0, [r3]
+    halt
+
+
+; input r3=RX mailbox byte address; clobbers r0-r2
+spi_tgt_rx_one:
+    ldi8.l r2, 0x20         ; rx_full bit
+spi_tgt_rx_wait:
+    bcu_stat r1
+    and r1, r2
+    jz spi_tgt_rx_wait
+    bcu_rx r0
+    st_dmem_b r0, [r3]
+    ret

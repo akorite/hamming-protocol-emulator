@@ -8,8 +8,10 @@ No hierarchical access, so the same tests run on RTL and gate level.
 
 Cycle budget: the gl_test harness allows <= 30,000 cycles total.  At
 half=5 (10 system clocks per SPI bit) a CSR write costs ~430 cycles, an
-SRAM word write ~590 and a word read ~670; the whole file stays well
-under 10k cycles.
+SRAM word write ~590 and a word read ~670.  The original tests are about
+10k cycles.  The U7 smoke additions use burst instruction loads and are
+approximately 4k (UART), 3k (SPI), and 4k (I2C) cycles, for an
+estimated total near 21k cycles, still comfortably below 30k.
 """
 
 import os
@@ -164,6 +166,28 @@ async def reset_dut(dut):
     await cycles(dut, 4)
 
 
+async def write_sram0_burst(dut, word_addr, words):
+    """Write consecutive SRAM0 words in one auto-incrementing transaction."""
+    await spi_begin(dut)
+    await spi_byte(dut, CMD_WR_SRAM0)
+    await spi_byte(dut, ((word_addr * 4) >> 8) & 0xFF)
+    await spi_byte(dut, (word_addr * 4) & 0xFF)
+    for word in words:
+        for shift in (24, 16, 8, 0):
+            await spi_byte(dut, (word >> shift) & 0xFF)
+    await spi_end(dut)
+
+
+async def write_instrs(dut, instrs):
+    """Pack low-half-first instruction slots and burst-load them at PC zero."""
+    words = []
+    for i in range(0, len(instrs), 2):
+        lo = instrs[i]
+        hi = instrs[i + 1] if i + 1 < len(instrs) else isa.enc_misc(isa.MISC_OPS["nop"])
+        words.append((hi << 16) | lo)
+    await write_sram0_burst(dut, 0, words)
+
+
 # ----------------------------------------------------------------------
 @cocotb.test()
 async def test_ae1_reset_xsafe(dut):
@@ -294,3 +318,132 @@ async def test_rle_capture_through_pins(dut):
     d2 = (r2 >> 16) & 0xFFFF
     assert 28 <= d1 <= 34, f"delta1 {d1} not near 30"
     assert 48 <= d2 <= 54, f"delta2 {d2} not near 50"
+
+
+# ----------------------------------------------------------------------
+# U7 pin-only baseline-protocol smoke tests.  These are deliberately small:
+# the exhaustive protocol matrix lives in test/unit/test_baseline_protocols.py;
+# here we only prove that the silicon pin path, host loading, and one visible
+# wire artifact for each protocol family work inside the gl_test cycle budget.
+# ----------------------------------------------------------------------
+@cocotb.test()
+async def test_uart_bcu_pin_smoke(dut):
+    """A single 3 Mbps BCU UART frame reaches uio0 through the pin router."""
+    await reset_dut(dut)
+
+    # uio0 data <= BCU0 tx_p; uio0 OE <= BCU0 tx_oe.
+    await write_csr(dut, CSR_PIN_ROUTER0, isa.ROUTER_SRC["bcu_tx_p"])
+    await write_csr(dut, 0x22, isa.ROUTER_SRC["bcu_tx_oe"])
+    base = isa.CSR_CORE_BANK
+    await write_csr(dut, base + isa.CORE_CSR["BCU_MODE"],
+                    isa.pack_bcu_mode(codec="nrz", stuff="off"))
+    await write_csr(dut, base + isa.CORE_CSR["BCU_BIT_LEN"], 11 - 1)
+    await write_csr(dut, base + isa.CORE_CSR["BCU_DPLL_CFG"],
+                    isa.pack_dpll_cfg(mode="hard_snap", win=0, period=20))
+
+    # Send byte 0x55: start0 + LSB data + even parity0 + stop1 = 0x4aa.
+    instrs = [
+        isa.enc_bcu_ctrl(0x20), isa.enc_bcu_ctrl(0x00), isa.enc_bcu_ctrl(0x03),
+        isa.enc_ldi8(0, 0, 0xAA), isa.enc_ldi8(0, 1, 0x04),
+        isa.enc_bcu_tx(0), isa.enc_misc(isa.MISC_OPS["halt"]),
+    ]
+    await write_instrs(dut, instrs)
+    await write_csr(dut, CSR_CTRL_RUN, 0x0001)
+
+    prev = 1
+    saw_low = False
+    saw_rise = False
+    saw_oe = False
+    for _ in range(280):
+        await RisingEdge(dut.clk)
+        level = (u(dut.uio_out) >> 0) & 1
+        saw_low |= level == 0
+        saw_rise |= prev == 0 and level == 1
+        saw_oe |= ((u(dut.uio_oe) >> 0) & 1) == 1
+        prev = level
+    assert saw_low and saw_rise and saw_oe, \
+        f"no UART-like BCU frame activity (low={saw_low}, rise={saw_rise}, oe={saw_oe})"
+    await write_csr(dut, CSR_CTRL_RUN, 0)
+
+
+@cocotb.test()
+async def test_spi_pin_routing_smoke(dut):
+    """Small SPI-like clock/data pin smoke on core0 uio0/uio4."""
+    await reset_dut(dut)
+
+    # core0 bit0 -> uio0 (clock), bit1 -> uio4 (data); same for OE channels.
+    pair = isa.ROUTER_SRC["core_out"]
+    await write_csr(dut, CSR_PIN_ROUTER0, pair)       # data channel 0
+    await write_csr(dut, 0x21, pair)                  # data channel 4
+    await write_csr(dut, 0x22, pair)                  # OE channel 8
+    await write_csr(dut, 0x23, pair)                  # OE channel 12
+
+    instrs = [
+        isa.enc_pin_oe(3, 3),
+        isa.enc_pin_out(3, 2),  # clock low, data high
+        isa.enc_set_anchor(0), isa.enc_wait_imm(4),
+        isa.enc_pin_out(3, 3),  # clock high, data high
+        isa.enc_set_anchor(0), isa.enc_wait_imm(4),
+        isa.enc_jmp(1),
+    ]
+    await write_instrs(dut, instrs)
+    await write_csr(dut, CSR_CTRL_RUN, 0x0001)
+
+    edges = 0
+    prev = 0
+    data_high_seen = False
+    for _ in range(100):
+        await RisingEdge(dut.clk)
+        clk = u(dut.uio_out) & 1
+        data = (u(dut.uio_out) >> 4) & 1
+        edges += clk != prev
+        data_high_seen |= data == 1
+        prev = clk
+    assert edges >= 4, f"SPI smoke clock only changed {edges} times"
+    assert data_high_seen, "SPI smoke data bit never visible"
+    assert (u(dut.uio_oe) & 0x11) == 0x11, "SPI smoke uio0/uio4 not enabled"
+    await write_csr(dut, CSR_CTRL_RUN, 0)
+
+
+@cocotb.test()
+async def test_i2c_open_drain_pin_smoke(dut):
+    """I2C-style OE-only open-drain control reaches uio2/uio6."""
+    await reset_dut(dut)
+
+    # core2 bit0/bit1 map to uio2/uio6 data and OE router channels.
+    pair = isa.ROUTER_SRC["core_out"]
+    packed = pair << 8  # position 2 within each four-channel router CSR
+    await write_csr(dut, CSR_PIN_ROUTER0, packed)   # data channel 2
+    await write_csr(dut, 0x21, packed)              # data channel 6
+    await write_csr(dut, 0x22, packed)              # OE channel 10
+    await write_csr(dut, 0x23, packed)              # OE channel 14
+    await write_csr(dut, isa.CSR["OPEN_DRAIN_EN"], (1 << 2) | (1 << 6))
+
+    # Repeated START-like/STOP-like OE sequence.  core_out remains zero, so
+    # enabled pins pull low and released pins are open-drain high impedance.
+    instrs = [
+        isa.enc_pin_out(3, 0),
+        isa.enc_pin_oe(3, 0), isa.enc_set_anchor(0), isa.enc_wait_imm(6),
+        isa.enc_pin_oe(3, 1), isa.enc_set_anchor(0), isa.enc_wait_imm(6),
+        isa.enc_pin_oe(3, 3), isa.enc_set_anchor(0), isa.enc_wait_imm(6),
+        isa.enc_pin_oe(3, 1), isa.enc_set_anchor(0), isa.enc_wait_imm(6),
+        isa.enc_pin_oe(3, 0), isa.enc_set_anchor(0), isa.enc_wait_imm(6),
+        isa.enc_jmp(1),
+    ]
+    await write_instrs(dut, instrs)
+    await write_csr(dut, CSR_CTRL_RUN, 0x0004)
+
+    mask = (1 << 2) | (1 << 6)
+    seen = set()
+    driven_high_error = False
+    for _ in range(160):
+        await RisingEdge(dut.clk)
+        oe = u(dut.uio_oe) & mask
+        seen.add(oe)
+        # The post-router open-drain clamp makes driven data zero.  Any set
+        # uio_out bit while enabled would violate the AE5 pin contract.
+        if (u(dut.uio_out) & oe) != 0:
+            driven_high_error = True
+    assert len(seen) >= 3, f"I2C smoke OE sequence did not advance: {seen}"
+    assert not driven_high_error, "I2C smoke drove a one while OE enabled"
+    await write_csr(dut, CSR_CTRL_RUN, 0)

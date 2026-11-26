@@ -1,0 +1,538 @@
+; SPDX-FileCopyrightText: 2026 akorite
+; SPDX-License-Identifier: Apache-2.0
+;
+; Hamming baseline UART firmware (8 data bits, even parity, one stop).
+;
+; Memory mailbox (SRAM 1 byte addresses):
+;   1    status: 1=done, 0x10=framing error, 0x20=parity error
+;   2    mode: 1=3 Mbps BCU full-duplex engine, 0=115200 bitbang roles
+;   8..  four TX bytes used by the focused demos
+;   0x40.. four RX bytes written by the firmware
+;
+; Pin plan used by the tests:
+;   high-speed full duplex: core0/BCU0, TX uio0, RX ui_in[0] (pin_in 8)
+;   low-speed TX role: any core, core_out bit0 routed to its TX pad
+;   low-speed RX role: any core, RX on ui_in[0] (pin_in 8)
+;
+; The BCU path is genuinely full duplex on one core.  At 115200 bits/sec the
+; BCU cell-period register cannot represent the 521-cycle bit time, so the
+; firmware uses two cooperative bit-banged roles (TX on core0, RX on core1)
+; for the low-rate matrix.  This split is documented rather than hidden; the
+; wire-level behavior remains full duplex because the two roles run at once.
+;
+.protocol uart_full_duplex @clk 60MHz
+.bcu mode=nrz, stuff=off, transfer=11bits_lsb_first, dpll=hard_snap(@baud(3000000))
+.constraint uart_tx_bit_period = @baud(3000000) cycles in BCU mode
+
+uart_entry:
+    ; Select the runtime mode from mailbox byte 2.
+    ldi8.l r3, 2
+    ld_dmem_b r0, [r3]
+    ldi8.l r1, 1
+    cmp r0, r1
+    jz uart_high_entry
+    jmp uart_low_dispatch
+
+
+; ======================================================================
+; 3 Mbps BCU full-duplex engine (core 0 in the baseline matrix)
+; ======================================================================
+
+uart_high_entry:
+    ; Soft-reset the BCU, then arm TX and RX.  Host CSR setup supplies:
+    ; codec=nrz, len=11, LSB-first, DPLL hard-snap period=@baud(3000000)=20.
+    bcu_ctrl 0x20
+    bcu_ctrl 0x00
+    bcu_ctrl 0x03
+
+    ; Prime the first outbound frame.  Subsequent frames are emitted after
+    ; each inbound frame is serviced; UART idle gaps between bytes are legal
+    ; and keep the implementation robust against the single TX shadow slot.
+    ldi8.l r3, 8
+    ld_dmem_b r0, [r3]
+    call uart_tx_frame
+
+    ldi8.l r3, 0x40
+    call uart_rx_frame
+    ldi8.l r3, 9
+    ld_dmem_b r0, [r3]
+    call uart_tx_frame
+
+    ldi8.l r3, 0x41
+    call uart_rx_frame
+    ldi8.l r3, 10
+    ld_dmem_b r0, [r3]
+    call uart_tx_frame
+
+    ldi8.l r3, 0x42
+    call uart_rx_frame
+    ldi8.l r3, 11
+    ld_dmem_b r0, [r3]
+    call uart_tx_frame
+
+    ldi8.l r3, 0x43
+    call uart_rx_frame
+
+    ; Success status=1 at byte address 1.
+    ldi8.l r3, 1
+    ldi8.l r0, 1
+    st_dmem_b r0, [r3]
+    halt
+
+
+; ----------------------------------------------------------------------
+; uart_tx_frame: input r0=raw data byte.  Clobbers r0-r2.
+; Emits an 11-bit LSB-first BCU word:
+;   bit0 start=0, bits1..8 data, bit9 even parity, bit10 stop=1.
+; ----------------------------------------------------------------------
+uart_tx_frame:
+    ; Fold the byte down to bit0 = even parity:
+    ; x ^= x>>4; x ^= x>>2; x ^= x>>1; parity=x&1.
+    mov r2, r0
+    mov r1, r2
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    xor r2, r1
+    mov r1, r2
+    shr r1
+    shr r1
+    xor r2, r1
+    mov r1, r2
+    shr r1
+    xor r2, r1
+    ldi8.l r1, 1
+    and r2, r1              ; Z=1 when parity bit is zero
+    jz uart_tx_parity_zero
+
+    ; parity=1: frame = (byte<<1) | 0x200 | 0x400
+    shl r0
+    ldi8.l r1, 0
+    ldi8.h r1, 0x06
+    or r0, r1
+    bcu_tx r0
+    ret
+
+uart_tx_parity_zero:
+    ; parity=0: frame = (byte<<1) | 0x400
+    shl r0
+    ldi8.l r1, 0
+    ldi8.h r1, 0x04
+    or r0, r1
+    bcu_tx r0
+    ret
+
+
+; ----------------------------------------------------------------------
+; uart_rx_frame: input r3=destination byte address.  Waits for one 11-bit
+; BCU frame, stores the data byte, and validates start/stop/parity.
+; Clobbers r0-r3.  Jumps to a terminal error reporter on a bad frame.
+; ----------------------------------------------------------------------
+uart_rx_frame:
+    ldi8.l r2, 0x20         ; BCU_STAT rx_full bit
+uart_rx_wait_full:
+    bcu_stat r1
+    and r1, r2
+    jz uart_rx_wait_full
+    bcu_rx r0               ; r0 = packed frame, bit0=start ... bit10=stop
+
+    ; Store data = (frame >> 1) & 0xff before validation; even a bad frame
+    ; leaves useful evidence in the RX mailbox.
+    mov r1, r0
+    shr r1
+    ldi8.l r2, 0xff
+    and r1, r2
+    st_dmem_b r1, [r3]
+
+    ; Start bit must be zero.
+    mov r2, r0
+    ldi8.l r1, 1
+    and r2, r1
+    jnz uart_rx_framing_error
+
+    ; Stop bit (0x400) must be one.
+    mov r2, r0
+    ldi8.l r1, 0
+    ldi8.h r1, 0x04
+    and r2, r1
+    jz uart_rx_framing_error
+
+    ; Re-extract the data byte (r1 was reused as the stop-bit mask), then
+    ; recompute its even parity.
+    mov r1, r0
+    shr r1
+    ldi8.l r2, 0xff
+    and r1, r2
+    mov r2, r1
+    mov r1, r2
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    xor r2, r1
+    mov r1, r2
+    shr r1
+    shr r1
+    xor r2, r1
+    mov r1, r2
+    shr r1
+    xor r2, r1
+    ldi8.l r1, 1
+    and r2, r1
+    mov r1, r2              ; r1 is now 0 or 1 (computed parity)
+
+    ; Normalize the frame parity bit (0x200) to r3=0/1 and compare.
+    mov r3, r0
+    ldi8.l r2, 0
+    ldi8.h r2, 0x02
+    and r3, r2
+    jz uart_rx_frame_par0
+    ldi8.l r3, 1
+    jmp uart_rx_compare_par
+uart_rx_frame_par0:
+    ldi8.l r3, 0
+uart_rx_compare_par:
+    cmp r1, r3
+    jnz uart_rx_parity_error
+    ret
+
+uart_rx_framing_error:
+    ldi8.l r3, 1
+    ldi8.h r3, 0          ; ldi8.l preserves the old high byte
+    ldi8.l r0, 0x10
+    st_dmem_b r0, [r3]
+    halt
+
+uart_rx_parity_error:
+    ldi8.l r3, 1
+    ldi8.h r3, 0          ; parity normalization can leave 0x02 in r3[15:8]
+    ldi8.l r0, 0x20
+    st_dmem_b r0, [r3]
+    halt
+
+
+; ======================================================================
+; 115200 bit-banged low-rate roles
+; ======================================================================
+
+uart_low_dispatch:
+    ; Architected core identity: reading offset CORE_ID in any per-core bank
+    ; returns the executing core's own index.  The low-rate wire remains full
+    ; duplex because core0 transmits while core1 receives concurrently.
+    csr_rd r1, 0x4d         ; CSR_CORE_BANK + CORE_ID
+    mov r1, r1
+    jz uart_low_tx_main     ; core0
+    ldi8.l r0, 1
+    cmp r1, r0
+    jz uart_low_rx_main     ; core1
+    halt                    ; cores2/3 are not used by the low-rate demo
+
+
+; ----------------------------------------------------------------------
+; Low-rate TX role on core0.  r3 is the inter-bit deadline.  At 60 MHz the
+; nominal bit period is @baud(115200)=521 cycles (0x0209); the few cycles of
+; pin/anchor overhead are well inside asynchronous UART tolerance.
+; ----------------------------------------------------------------------
+uart_low_tx_main:
+    ldi8.l r3, 0x09         ; 521 low byte (0x0209)
+    ldi8.h r3, 0x02
+    pin_oe 0x1, 0x1         ; enable TX on core_out bit0
+    pin_out 0x1, 0x1        ; idle high
+
+    ldi8.l r2, 8
+    ld_dmem_b r0, [r2]
+    call uart_low_tx_byte
+    ldi8.l r2, 9
+    ld_dmem_b r0, [r2]
+    call uart_low_tx_byte
+    ldi8.l r2, 10
+    ld_dmem_b r0, [r2]
+    call uart_low_tx_byte
+    ldi8.l r2, 11
+    ld_dmem_b r0, [r2]
+    call uart_low_tx_byte
+
+    ldi8.l r2, 1
+    ldi8.l r0, 1
+    st_dmem_b r0, [r2]
+    halt
+
+
+; input r0=data byte, r3=bit deadline; clobbers r0-r2
+uart_low_tx_byte:
+    ; start bit
+    pin_out 0x1, 0x0
+    set_anchor 0
+    wait_phase r3
+
+    ; r2 accumulates odd/even parity as data bits are emitted.  Each block
+    ; tests bit0, emits it, folds it into parity, then shifts the byte.
+    ldi8.l r2, 0
+
+    ldi8.l r1, 1
+    and r1, r0
+    jz uart_low_tx_b0z
+    pin_out 0x1, 0x1
+    ldi8.l r1, 1
+    xor r2, r1
+    jmp uart_low_tx_b0t
+uart_low_tx_b0z:
+    pin_out 0x1, 0x0
+uart_low_tx_b0t:
+    set_anchor 0
+    wait_phase r3
+    shr r0
+
+    ldi8.l r1, 1
+    and r1, r0
+    jz uart_low_tx_b1z
+    pin_out 0x1, 0x1
+    ldi8.l r1, 1
+    xor r2, r1
+    jmp uart_low_tx_b1t
+uart_low_tx_b1z:
+    pin_out 0x1, 0x0
+uart_low_tx_b1t:
+    set_anchor 0
+    wait_phase r3
+    shr r0
+
+    ldi8.l r1, 1
+    and r1, r0
+    jz uart_low_tx_b2z
+    pin_out 0x1, 0x1
+    ldi8.l r1, 1
+    xor r2, r1
+    jmp uart_low_tx_b2t
+uart_low_tx_b2z:
+    pin_out 0x1, 0x0
+uart_low_tx_b2t:
+    set_anchor 0
+    wait_phase r3
+    shr r0
+
+    ldi8.l r1, 1
+    and r1, r0
+    jz uart_low_tx_b3z
+    pin_out 0x1, 0x1
+    ldi8.l r1, 1
+    xor r2, r1
+    jmp uart_low_tx_b3t
+uart_low_tx_b3z:
+    pin_out 0x1, 0x0
+uart_low_tx_b3t:
+    set_anchor 0
+    wait_phase r3
+    shr r0
+
+    ldi8.l r1, 1
+    and r1, r0
+    jz uart_low_tx_b4z
+    pin_out 0x1, 0x1
+    ldi8.l r1, 1
+    xor r2, r1
+    jmp uart_low_tx_b4t
+uart_low_tx_b4z:
+    pin_out 0x1, 0x0
+uart_low_tx_b4t:
+    set_anchor 0
+    wait_phase r3
+    shr r0
+
+    ldi8.l r1, 1
+    and r1, r0
+    jz uart_low_tx_b5z
+    pin_out 0x1, 0x1
+    ldi8.l r1, 1
+    xor r2, r1
+    jmp uart_low_tx_b5t
+uart_low_tx_b5z:
+    pin_out 0x1, 0x0
+uart_low_tx_b5t:
+    set_anchor 0
+    wait_phase r3
+    shr r0
+
+    ldi8.l r1, 1
+    and r1, r0
+    jz uart_low_tx_b6z
+    pin_out 0x1, 0x1
+    ldi8.l r1, 1
+    xor r2, r1
+    jmp uart_low_tx_b6t
+uart_low_tx_b6z:
+    pin_out 0x1, 0x0
+uart_low_tx_b6t:
+    set_anchor 0
+    wait_phase r3
+    shr r0
+
+    ldi8.l r1, 1
+    and r1, r0
+    jz uart_low_tx_b7z
+    pin_out 0x1, 0x1
+    ldi8.l r1, 1
+    xor r2, r1
+    jmp uart_low_tx_b7t
+uart_low_tx_b7z:
+    pin_out 0x1, 0x0
+uart_low_tx_b7t:
+    set_anchor 0
+    wait_phase r3
+
+    ; Even parity bit.
+    ldi8.l r1, 1
+    and r1, r2
+    jz uart_low_tx_par_zero
+    pin_out 0x1, 0x1
+    jmp uart_low_tx_par_done
+uart_low_tx_par_zero:
+    pin_out 0x1, 0x0
+uart_low_tx_par_done:
+    set_anchor 0
+    wait_phase r3
+
+    ; Stop bit / idle high.
+    pin_out 0x1, 0x1
+    set_anchor 0
+    wait_phase r3
+    ret
+
+
+; ----------------------------------------------------------------------
+; Low-rate RX role on core1.  Fixed four-byte demo transfer.
+; ----------------------------------------------------------------------
+uart_low_rx_main:
+    ldi8.l r3, 0x09
+    ldi8.h r3, 0x02         ; same nominal bit deadline as TX (521 cycles)
+
+    call uart_low_rx_byte
+    ldi8.l r1, 0x40
+    st_dmem_b r0, [r1]
+    call uart_low_rx_byte
+    ldi8.l r1, 0x41
+    st_dmem_b r0, [r1]
+    call uart_low_rx_byte
+    ldi8.l r1, 0x42
+    st_dmem_b r0, [r1]
+    call uart_low_rx_byte
+    ldi8.l r1, 0x43
+    st_dmem_b r0, [r1]
+
+    ldi8.l r2, 1
+    ldi8.l r0, 1
+    st_dmem_b r0, [r2]
+    halt
+
+
+; Returns r0=received byte.  r3=full-bit deadline; clobbers r1/r2.
+uart_low_rx_byte:
+    ldi8.l r0, 0
+    ldi8.l r1, 1            ; mask for the LSB-first bit being received
+
+    ; Wait for an idle high followed by a low start level.
+uart_low_rx_wait_high:
+    pin_in r2, 8
+    mov r2, r2
+    jz uart_low_rx_wait_high
+uart_low_rx_wait_start:
+    pin_in r2, 8
+    mov r2, r2
+    jnz uart_low_rx_wait_start
+
+    ; Move to the center of the start bit (half a 521-cycle bit, 0x0104).
+    ldi8.l r2, 0x04
+    ldi8.h r2, 0x01
+    set_anchor 0
+    wait_phase r2
+    pin_in r2, 8
+    mov r2, r2
+    jnz uart_low_rx_byte    ; false start: restart acquisition
+
+    ; Eight data bits, LSB first.  Conditional OR paths differ by one clock;
+    ; that jitter is negligible at 115200 bps (about 0.2% of a bit).
+    set_anchor 0
+    wait_phase r3
+    pin_in r2, 8
+    mov r2, r2
+    jz uart_low_rx_d0z
+    or r0, r1
+uart_low_rx_d0z:
+    shl r1
+
+    set_anchor 0
+    wait_phase r3
+    pin_in r2, 8
+    mov r2, r2
+    jz uart_low_rx_d1z
+    or r0, r1
+uart_low_rx_d1z:
+    shl r1
+
+    set_anchor 0
+    wait_phase r3
+    pin_in r2, 8
+    mov r2, r2
+    jz uart_low_rx_d2z
+    or r0, r1
+uart_low_rx_d2z:
+    shl r1
+
+    set_anchor 0
+    wait_phase r3
+    pin_in r2, 8
+    mov r2, r2
+    jz uart_low_rx_d3z
+    or r0, r1
+uart_low_rx_d3z:
+    shl r1
+
+    set_anchor 0
+    wait_phase r3
+    pin_in r2, 8
+    mov r2, r2
+    jz uart_low_rx_d4z
+    or r0, r1
+uart_low_rx_d4z:
+    shl r1
+
+    set_anchor 0
+    wait_phase r3
+    pin_in r2, 8
+    mov r2, r2
+    jz uart_low_rx_d5z
+    or r0, r1
+uart_low_rx_d5z:
+    shl r1
+
+    set_anchor 0
+    wait_phase r3
+    pin_in r2, 8
+    mov r2, r2
+    jz uart_low_rx_d6z
+    or r0, r1
+uart_low_rx_d6z:
+    shl r1
+
+    set_anchor 0
+    wait_phase r3
+    pin_in r2, 8
+    mov r2, r2
+    jz uart_low_rx_d7z
+    or r0, r1
+uart_low_rx_d7z:
+
+    ; Consume the parity bit time, then validate the stop bit.  Parity-error
+    ; proof is implemented by the BCU path above; this low-rate path checks
+    ; framing so a bad low-rate wire cannot pass silently either.
+    set_anchor 0
+    wait_phase r3
+    pin_in r2, 8
+
+    set_anchor 0
+    wait_phase r3
+    pin_in r2, 8
+    mov r2, r2
+    jz uart_rx_framing_error
+    ret

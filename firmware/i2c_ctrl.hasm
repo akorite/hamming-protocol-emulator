@@ -1,0 +1,227 @@
+; SPDX-FileCopyrightText: 2026 akorite
+; SPDX-License-Identifier: Apache-2.0
+;
+; Hamming baseline I2C controller firmware (open-drain, fixed two-byte demo).
+;
+; Mailbox bytes: 1 status, 2 speed(0=100k,1=400k), 4 direction(0=W,1=R),
+; 8 address+R/W byte, 9..10 write data, 0x40..41 read data.
+; Status: 1 done, 0x40 NACK, 0x41 arbitration loss.
+;
+; Pins (core2): SDA=uio2/core bit0, SCL=uio6/core bit1.  core_out remains 0;
+; core_oe performs open-drain pull-down control.  The pin matrix must enable
+; open_drain_en and pin_filt_en on both pins for AE5.
+;
+.protocol i2c_controller @clk 60MHz
+.constraint scl_half_period = @us(5) cycles at 100kHz or @us(1.25) at 400kHz
+
+i2c_ctrl_entry:
+    pin_out 0x3, 0x0
+    pin_oe 0x3, 0x0          ; both lines released at reset/idle
+
+    ; Load the half-bit WAIT delta in r3 from speed byte2.
+    ldi8.l r2, 2
+    ld_dmem_b r0, [r2]
+    mov r0, r0
+    jz i2c_cfg_100k
+    ldi8.l r3, 55           ; 400 kHz fast path (deadline plus loop overhead)
+    jmp i2c_cfg_done
+i2c_cfg_100k:
+    ldi8.l r3, 0x0c         ; 268 + overhead ~= 300 cycles at 100 kHz
+    ldi8.h r3, 0x01
+i2c_cfg_done:
+
+    ; START, then the address byte supplied at byte8.
+    call i2c_start
+    ldi8.l r2, 8
+    ld_dmem_b r0, [r2]
+    call i2c_write_byte
+    call i2c_read_ack
+
+    ; Direction byte4 selects the fixed two-byte write or read sequence.
+    ldi8.l r2, 4
+    ld_dmem_b r0, [r2]
+    mov r0, r0
+    jnz i2c_ctrl_read2
+
+    ; Write path: two data bytes at 9 and 10, each followed by ACK.
+    ldi8.l r2, 9
+    ld_dmem_b r0, [r2]
+    call i2c_write_byte
+    call i2c_read_ack
+    ldi8.l r2, 10
+    ld_dmem_b r0, [r2]
+    call i2c_write_byte
+    call i2c_read_ack
+    jmp i2c_ctrl_finish
+
+i2c_ctrl_read2:
+    ; Read byte0, store at 0x40, ACK it.
+    call i2c_read_byte
+    ldi8.l r2, 0x40
+    st_dmem_b r0, [r2]
+    ldi8.l r2, 0
+    mov r2, r2              ; Z=1 selects an ACK low bit in write_bit
+    call i2c_write_bit
+    ; Read byte1, store at 0x41, then NACK as the end-of-read signal.
+    call i2c_read_byte
+    ldi8.l r2, 0x41
+    st_dmem_b r0, [r2]
+    ldi8.l r2, 1
+    mov r2, r2              ; Z=0 selects a NACK/released bit
+    call i2c_write_bit
+
+i2c_ctrl_finish:
+    call i2c_stop
+    ldi8.l r2, 1
+    ldi8.l r0, 1
+    st_dmem_b r0, [r2]
+    halt
+
+
+; ----------------------------------------------------------------------
+; START/STOP primitives.  r3 is the half-period deadline everywhere.
+; ----------------------------------------------------------------------
+i2c_start:
+    pin_oe 0x3, 0x0
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x1         ; SDA low while SCL remains released/high
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x3         ; then SCL low
+    set_anchor 0
+    wait_phase r3
+    ret
+
+i2c_stop:
+    pin_oe 0x3, 0x3         ; SDA low, SCL low
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x1         ; release SCL, keep SDA low
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x0         ; release SDA: rising SDA while SCL high = STOP
+    set_anchor 0
+    wait_phase r3
+    ret
+
+
+; ----------------------------------------------------------------------
+; write byte: r0=data, r1=count, r2=scratch, r3=timing.  MSB first.
+; ----------------------------------------------------------------------
+i2c_write_byte:
+    ldi8.l r1, 8
+i2c_wb_loop:
+    ldi8.l r2, 0x80
+    and r2, r0              ; Z=1 when MSB is zero
+    jz i2c_wb_zero
+    ldi8.l r2, 1
+    mov r2, r2              ; force Z=0 for the one bit
+    call i2c_write_bit
+    jmp i2c_wb_next
+i2c_wb_zero:
+    ldi8.l r2, 0
+    mov r2, r2              ; force Z=1 for the zero bit
+    call i2c_write_bit
+i2c_wb_next:
+    shl r0
+    dec r1
+    jnz i2c_wb_loop
+    ret
+
+
+; Enter with Z selecting bit value (Z=1 means write zero).  All clock-stretch
+; and arbitration checks are inline so this can run at return-stack depth 2.
+i2c_write_bit:
+    jz i2c_write_zero
+    ; bit 1: release SDA while holding SCL low, then release SCL.
+    pin_oe 0x3, 0x2
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x0
+i2c_w1_wait_scl:
+    pin_in r2, 6
+    mov r2, r2
+    jz i2c_w1_wait_scl
+    ; Arbitration: we released SDA to one; another master pulling it low wins.
+    pin_in r2, 2
+    mov r2, r2
+    jz i2c_arbitration_loss
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x2         ; pull SCL low again, SDA remains released
+    ret
+
+i2c_write_zero:
+    ; bit 0: hold SDA low; no arbitration check is needed because low dominates.
+    pin_oe 0x3, 0x3
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x1         ; release SCL only
+i2c_w0_wait_scl:
+    pin_in r2, 6
+    mov r2, r2
+    jz i2c_w0_wait_scl
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x3
+    ret
+
+
+; Ninth-bit ACK read.  Terminal NACK reporter is entered if SDA remains high.
+i2c_read_ack:
+    pin_oe 0x3, 0x2         ; release SDA, hold SCL low
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x0         ; release SCL and honor target stretching
+i2c_ack_wait_scl:
+    pin_in r2, 6
+    mov r2, r2
+    jz i2c_ack_wait_scl
+    pin_in r2, 2
+    mov r2, r2
+    jnz i2c_nack_error
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x2
+    ret
+
+
+; Read one byte MSB-first into r0.  The controller releases SDA for the byte.
+i2c_read_byte:
+    ldi8.l r0, 0
+    ldi8.l r1, 8
+    pin_oe 0x3, 0x2
+i2c_rb_loop:
+    shl r0
+    pin_oe 0x3, 0x0         ; release SCL
+i2c_rb_wait_scl:
+    pin_in r2, 6
+    mov r2, r2
+    jz i2c_rb_wait_scl
+    pin_in r2, 2
+    or r0, r2
+    set_anchor 0
+    wait_phase r3
+    pin_oe 0x3, 0x2         ; pull SCL low, still releasing SDA
+    set_anchor 0
+    wait_phase r3
+    dec r1
+    jnz i2c_rb_loop
+    ret
+
+
+; Terminal error reporters.  Both release the bus immediately (open-drain safe).
+i2c_nack_error:
+    pin_oe 0x3, 0x0
+    ldi8.l r2, 1
+    ldi8.l r0, 0x40
+    st_dmem_b r0, [r2]
+    halt
+
+i2c_arbitration_loss:
+    pin_oe 0x3, 0x0
+    ldi8.l r2, 1
+    ldi8.l r0, 0x41
+    st_dmem_b r0, [r2]
+    halt
