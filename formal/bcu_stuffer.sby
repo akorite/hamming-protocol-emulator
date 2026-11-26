@@ -1,0 +1,36 @@
+[tasks]
+bmc
+prove
+cover
+
+[options]
+# The invariant is bit-event driven.  Depth 64 covers a full 16-bit word with
+# margin at unit-period cover settings and several bit cells at short nonzero
+# periods; unbounded correctness comes from k-induction rather than unrolling
+# a worst-case 256-clock bit period.
+bmc: mode bmc
+bmc: depth 64
+prove: mode prove
+prove: depth 16
+cover: mode cover
+cover: depth 64
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+read -formal bcu_stuffer_top.v hamming_bcu.v hamming_bcu_crc.v hamming_bcu_dpll.v
+prep -top bcu_stuffer_top
+# The DPLL is a nested, already separately proven component here.  Strip its
+# embedded formal cells in this harness: otherwise the cover task would try to
+# justify DPLL recovery witnesses even though this reduced TX-only environment
+# correctly ties RX arm off.  The stuffer's own cover statements remain intact.
+select -module hamming_bcu_dpll
+chformal -remove
+select -clear
+
+[files]
+bcu_stuffer_top.v
+../src/hamming_bcu.v
+../src/hamming_bcu_crc.v
+../src/hamming_bcu_dpll.v

@@ -1,0 +1,26 @@
+[tasks]
+bmc
+prove
+cover
+
+[options]
+# EOF needs nine half-cell misses.  Cover may select a short legal period, so
+# depth 64 reaches all profile/EOF witnesses without unrolling the degenerate
+# 256-clock maximum.  The phase/lock properties are one-transition inductive,
+# hence k=12 is conservative.
+bmc: mode bmc
+bmc: depth 64
+prove: mode prove
+prove: depth 12
+cover: mode cover
+cover: depth 64
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+read -formal hamming_bcu_dpll.v
+prep -top hamming_bcu_dpll
+
+[files]
+../src/hamming_bcu_dpll.v

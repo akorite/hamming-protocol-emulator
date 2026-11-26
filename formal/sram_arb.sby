@@ -1,0 +1,26 @@
+[tasks]
+bmc
+prove
+cover
+
+[options]
+# Six clients require at most five intervening grants; the read-return pipe
+# adds four state steps.  Depth 20 covers two full worst-case rotations plus
+# response/reset witnesses.  k=12 gives induction ample slack over that bound.
+bmc: mode bmc
+bmc: depth 20
+prove: mode prove
+prove: depth 12
+cover: mode cover
+cover: depth 20
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+read -formal hamming_sram_arb.v hamming_sram_2kb.v
+prep -top hamming_sram_arb
+
+[files]
+../src/hamming_sram_arb.v
+../src/hamming_sram_2kb.v

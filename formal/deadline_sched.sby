@@ -1,0 +1,30 @@
+[tasks]
+bmc
+prove
+cover
+
+[options]
+# Program fetch takes only a few cycles through the three-edge instruction
+# memory model.  Depth 40 reaches WAIT issue, exact-release cover for a small
+# legal delta, overshoot cover for delta zero, and maximum-delta/wrap issue
+# witnesses.  The unbounded no-overshoot invariant is inductive in one timer
+# step, so k=8 is deliberately conservative and avoids unrolling 65535 waits.
+bmc: mode bmc
+bmc: depth 40
+prove: mode prove
+prove: depth 8
+cover: mode cover
+cover: depth 40
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+read -formal deadline_sched_top.v hamming_core.v hamming_icache.v
+prep -top deadline_sched_top
+
+[files]
+deadline_sched_top.v
+../src/hamming_core.v
+../src/hamming_icache.v
+../src/hamming_defs.vh
