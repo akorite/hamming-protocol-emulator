@@ -129,7 +129,20 @@ class I2CTargetBfm:
         raise I2CProtocolError("I2C target timeout waiting for START")
 
     async def _wait_scl(self, level):
-        await self.bus.wait_line("scl", level, self.timeout_cycles)
+        # A real I2C input stage rejects narrow spikes.  Require four
+        # consecutive samples so the intentional 3-cycle fault pulse does not
+        # clock the independent target; pass/fail then isolates the DUT filter.
+        want = level & 1
+        stable = 0
+        for _ in range(self.timeout_cycles):
+            await ClockCycles(self.clk, 1)
+            if self.bus.sample("scl") == want:
+                stable += 1
+                if stable >= 4:
+                    return
+            else:
+                stable = 0
+        raise I2CProtocolError(f"I2C target timeout waiting for filtered SCL={want}")
 
     async def receive_byte(self):
         value = 0

@@ -1,274 +1,156 @@
 ; SPDX-FileCopyrightText: 2026 akorite
 ; SPDX-License-Identifier: Apache-2.0
 ;
-; Hamming baseline SPI controller firmware.
+; Hamming baseline SPI controller firmware.  Mailbox: byte1 status, byte2
+; config (mode in [1:0], 10 MHz in bit4), TX bytes 8..9, RX bytes 0x40...
+; SCLK=core bit0, CS_N=core bit2, MOSI=BCU1 tx_p, MISO enters BCU1 via LUT.
 ;
-; Mailbox (SRAM 1 bytes):
-;   1 status (1=done), 2 configuration, 8..11 four TX bytes, 0x40.. RX bytes.
-;   cfg[3:0]=SPI mode 0..3, cfg[4]=1 for 10 MHz / 0 for 1 MHz.
-;
-; Pin plan (core1): SCLK=core_out bit0 routed to uio1, MOSI=BCU1 tx_p routed
-; to uio5, CS_N=core_out bit2 routed to uo_out1, MISO enters BCU1 through LUT2.
-; The host writes BCU mode/bit length/symbol period before CTRL_RUN.
-;
-; The 10 MHz clock burst is a six-instruction cached loop: one bit period is
-; exactly six system clocks.  The 1 MHz path uses WAIT_PHASE deadlines in the
-; same structural loop.  BCU serialization supplies the MOSI bit stream and
-; the BCU receiver collects the simultaneous MISO byte.
+; Deliberate 10 MHz cache layout: each fast mode occupies a 16-slot-aligned
+; block.  The repeated six-instruction clock loop starts at the boundary and
+; uses cache indices 0..2 (ret/prewarm call share index 3).  The four lead-in
+; instructions after the prewarm return use indices 4..5.  The mode-specific
+; clock-entry prologues are placed at slots 12 modulo 16, hence indices 6..7.
+; Every index is therefore unique: prewarming leaves the loop, lead-in, and
+; entry prologue simultaneously resident, and the real 10 MHz burst never
+; misses in its steady loop.  The lead-in rewrites ctrl 0x01 after prewarm,
+; resetting RX/DPLL state while keeping TX armed; the clock entry arms RX at
+; the CPHA-appropriate edge.  CPHA=1 entries drive the first clock edge before
+; arming RX, making that edge the shift edge instead of reusing CPHA=0 timing.
 ;
 .protocol spi_controller @clk 60MHz
 .bcu mode=nrz, stuff=off, transfer=8bits_msb_first, period=@baud(10000000)
 .constraint spi_clock_period = 6 cycles at 10MHz, 60 cycles at 1MHz
 
+
 spi_ctrl_entry:
-    ; Read configuration and select the clock-burst timing path.
     ldi8.l r3, 2
     ld_dmem_b r0, [r3]
     ldi8.l r1, 0x10
     and r1, r0
-    jz spi_ctrl_slow_setup
-    jmp spi_ctrl_fast_setup
-
-
-; ----------------------------------------------------------------------
-; Shared initialization.  CPOL is extracted from cfg bit1.  The routines
-; below duplicate only the small clock loop; all byte/mailbox handling is common.
-; ----------------------------------------------------------------------
-spi_ctrl_fast_setup:
-    ; r2 is unused by the fast loop.  Select CPOL clock resting level.
-    ldi8.l r3, 2
-    ld_dmem_b r0, [r3]
+    jz spi_slow_select_cpol
+    jmp spi_fast_select_cpol
+spi_fast_select_cpol:
     ldi8.l r1, 2
     and r1, r0
-    jz spi_fast_cpol0
-    jmp spi_fast_cpol1
-
-spi_ctrl_slow_setup:
-    ; WAIT delta tuned so deadline+loop overhead gives a 60-cycle bit period.
+    jz spi_fast_select_cpha0
+    jmp spi_fast_select_cpha1
+spi_fast_select_cpha0:
+    ldi8.l r1, 1
+    and r1, r0
+    jz spi_fast_m0_setup
+    jmp spi_fast_m1_setup
+spi_fast_select_cpha1:
+    ldi8.l r1, 1
+    and r1, r0
+    jz spi_fast_m2_setup
+    jmp spi_fast_m3_setup
+spi_slow_select_cpol:
     ldi8.l r2, 27
-    ldi8.l r3, 2
-    ld_dmem_b r0, [r3]
     ldi8.l r1, 2
     and r1, r0
-    jz spi_slow_cpol0
-    jmp spi_slow_cpol1
+    jz spi_slow_select_cpha0
+    jmp spi_slow_select_cpha1
+spi_slow_select_cpha0:
+    ldi8.l r1, 1
+    and r1, r0
+    jz spi_slow_m0_setup
+    jmp spi_slow_m1_setup
+spi_slow_select_cpha1:
+    ldi8.l r1, 1
+    and r1, r0
+    jz spi_slow_m2_setup
+    jmp spi_slow_m3_setup
 
 
-; ======================================================================
-; 10 MHz CPOL=0 path
-; ======================================================================
-spi_fast_cpol0:
+spi_fast_m0_setup:
     bcu_ctrl 0x20
     bcu_ctrl 0x00
-    bcu_ctrl 0x03
-    pin_oe 0x1, 0x1          ; enable SCLK bit0
-    pin_out 0x5, 0x4         ; CS_N high, SCLK low
-
-    ldi8.l r3, 8
-    ld_dmem_b r0, [r3]
-    call spi_fast0_byte
-    ldi8.l r3, 0x40
-    st_dmem_b r0, [r3]
-
-    ldi8.l r3, 9
-    ld_dmem_b r0, [r3]
-    call spi_fast0_byte
-    ldi8.l r3, 0x41
-    st_dmem_b r0, [r3]
-
-    jmp spi_ctrl_done
-
-
-; input r0=MOSI byte, returns r0=MISO byte.  r1 is the bit-loop count.
-spi_fast0_byte:
-    ; Rephase the free-running RX sampler for every byte.  Inter-byte
-    ; mailbox/branch time is legal SPI clock idle time, but it is not a
-    ; multiple of the BCU cell phase; without this reset the sampler walks.
-    bcu_ctrl 0x00
-    bcu_ctrl 0x20
-    bcu_ctrl 0x00
-    bcu_ctrl 0x03
-    call spi_fast0_clock8  ; icache prewarm while CS_N is high
-    pin_out 0x5, 0x0         ; CS_N low, SCLK stays low
-    bcu_tx r0
-    nop
-    nop
-    nop
-    nop
-    nop
-    call spi_fast0_clock8
-    bcu_rx r0
-    pin_out 0x5, 0x4         ; end byte: CS_N high, SCLK low for CPOL=0
-    ret
-
-spi_fast0_clock8:
-    ldi8.l r1, 8
-spi_fast0_clock8_clk:
-    pin_out 0x1, 0x1         ; rising edge
-    nop
-    pin_out 0x1, 0x0         ; falling edge (period is exactly 6 clocks)
-    nop
-    dec r1
-    jnz spi_fast0_clock8_clk
-    ret
-
-
-; ======================================================================
-; 10 MHz CPOL=1 path
-; ======================================================================
-spi_fast_cpol1:
-    bcu_ctrl 0x20
-    bcu_ctrl 0x00
-    bcu_ctrl 0x03
-    pin_oe 0x1, 0x1
-    pin_out 0x5, 0x5         ; CS_N high, SCLK high
-
-    ldi8.l r3, 8
-    ld_dmem_b r0, [r3]
-    call spi_fast1_byte
-    ldi8.l r3, 0x40
-    st_dmem_b r0, [r3]
-    ldi8.l r3, 9
-    ld_dmem_b r0, [r3]
-    call spi_fast1_byte
-    ldi8.l r3, 0x41
-    st_dmem_b r0, [r3]
-    jmp spi_ctrl_done
-
-spi_fast1_byte:
-    ; Rephase the free-running RX sampler for every byte.  Inter-byte
-    ; mailbox/branch time is legal SPI clock idle time, but it is not a
-    ; multiple of the BCU cell phase; without this reset the sampler walks.
-    bcu_ctrl 0x00
-    bcu_ctrl 0x20
-    bcu_ctrl 0x00
-    bcu_ctrl 0x03
-    call spi_fast1_clock8  ; icache prewarm while CS_N is high
-    pin_out 0x5, 0x1         ; CS_N low, SCLK stays high
-    bcu_tx r0
-    nop
-    nop
-    nop
-    nop
-    nop
-    call spi_fast1_clock8
-    bcu_rx r0
-    pin_out 0x5, 0x5         ; end byte: CS_N high, SCLK high for CPOL=1
-    ret
-
-spi_fast1_clock8:
-    ldi8.l r1, 8
-spi_fast1_clock8_clk:
-    pin_out 0x1, 0x0         ; falling edge
-    nop
-    pin_out 0x1, 0x1         ; rising edge, exact 6-cycle period
-    nop
-    dec r1
-    jnz spi_fast1_clock8_clk
-    ret
-
-
-; ======================================================================
-; 1 MHz paths (same pin polarity structure, deadline-timed clock loop)
-; ======================================================================
-spi_slow_cpol0:
-    bcu_ctrl 0x20
-    bcu_ctrl 0x00
-    bcu_ctrl 0x03
     pin_oe 0x1, 0x1
     pin_out 0x5, 0x4
     ldi8.l r3, 8
     ld_dmem_b r0, [r3]
-    call spi_slow0_byte
+    call spi_fast_m0_byte
     ldi8.l r3, 0x40
     st_dmem_b r0, [r3]
     ldi8.l r3, 9
     ld_dmem_b r0, [r3]
-    call spi_slow0_byte
+    call spi_fast_m0_byte
     ldi8.l r3, 0x41
     st_dmem_b r0, [r3]
     jmp spi_ctrl_done
-
-spi_slow0_byte:
-    ; Rephase the free-running RX sampler for every byte.  Inter-byte
-    ; mailbox/branch time is legal SPI clock idle time, but it is not a
-    ; multiple of the BCU cell phase; without this reset the sampler walks.
+spi_fast_m0_byte:
     bcu_ctrl 0x00
     bcu_ctrl 0x20
-    bcu_ctrl 0x00
-    bcu_ctrl 0x03
-    call spi_slow0_clock8  ; icache prewarm while CS_N is high
-    pin_out 0x5, 0x0
-    bcu_tx r0
-    call spi_slow0_clock8
-    bcu_rx r0
-    pin_out 0x5, 0x4         ; end byte: CS_N high, SCLK low for CPOL=0
-    ret
+    bcu_ctrl 0x01
+    jmp spi_fast_m0_prewarm
 
-spi_slow0_clock8:
-    ldi8.l r1, 8
-spi_slow0_clock8_clk:
-    pin_out 0x1, 0x1
-    set_anchor 0
-    wait_phase r2
-    pin_out 0x1, 0x0
-    set_anchor 0
-    wait_phase r2
-    dec r1
-    jnz spi_slow0_clock8_clk
-    ret
-
-
-spi_slow_cpol1:
+spi_fast_m1_setup:
     bcu_ctrl 0x20
     bcu_ctrl 0x00
-    bcu_ctrl 0x03
+    pin_oe 0x1, 0x1
+    pin_out 0x5, 0x4
+    ldi8.l r3, 8
+    ld_dmem_b r0, [r3]
+    call spi_fast_m1_byte
+    ldi8.l r3, 0x40
+    st_dmem_b r0, [r3]
+    ldi8.l r3, 9
+    ld_dmem_b r0, [r3]
+    call spi_fast_m1_byte
+    ldi8.l r3, 0x41
+    st_dmem_b r0, [r3]
+    jmp spi_ctrl_done
+spi_fast_m1_byte:
+    bcu_ctrl 0x00
+    bcu_ctrl 0x20
+    bcu_ctrl 0x01
+    jmp spi_fast_m1_prewarm
+
+spi_fast_m2_setup:
+    bcu_ctrl 0x20
+    bcu_ctrl 0x00
     pin_oe 0x1, 0x1
     pin_out 0x5, 0x5
     ldi8.l r3, 8
     ld_dmem_b r0, [r3]
-    call spi_slow1_byte
+    call spi_fast_m2_byte
     ldi8.l r3, 0x40
     st_dmem_b r0, [r3]
     ldi8.l r3, 9
     ld_dmem_b r0, [r3]
-    call spi_slow1_byte
+    call spi_fast_m2_byte
     ldi8.l r3, 0x41
     st_dmem_b r0, [r3]
     jmp spi_ctrl_done
-
-spi_slow1_byte:
-    ; Rephase the free-running RX sampler for every byte.  Inter-byte
-    ; mailbox/branch time is legal SPI clock idle time, but it is not a
-    ; multiple of the BCU cell phase; without this reset the sampler walks.
+spi_fast_m2_byte:
     bcu_ctrl 0x00
     bcu_ctrl 0x20
+    bcu_ctrl 0x01
+    jmp spi_fast_m2_prewarm
+
+spi_fast_m3_setup:
+    bcu_ctrl 0x20
     bcu_ctrl 0x00
-    bcu_ctrl 0x03
-    call spi_slow1_clock8  ; icache prewarm while CS_N is high
-    pin_out 0x5, 0x1
-    bcu_tx r0
-    call spi_slow1_clock8
-    bcu_rx r0
-    pin_out 0x5, 0x5         ; end byte: CS_N high, SCLK high for CPOL=1
-    ret
-
-spi_slow1_clock8:
-    ldi8.l r1, 8
-spi_slow1_clock8_clk:
-    pin_out 0x1, 0x0
-    set_anchor 0
-    wait_phase r2
-    pin_out 0x1, 0x1
-    set_anchor 0
-    wait_phase r2
-    dec r1
-    jnz spi_slow1_clock8_clk
-    ret
-
+    pin_oe 0x1, 0x1
+    pin_out 0x5, 0x5
+    ldi8.l r3, 8
+    ld_dmem_b r0, [r3]
+    call spi_fast_m3_byte
+    ldi8.l r3, 0x40
+    st_dmem_b r0, [r3]
+    ldi8.l r3, 9
+    ld_dmem_b r0, [r3]
+    call spi_fast_m3_byte
+    ldi8.l r3, 0x41
+    st_dmem_b r0, [r3]
+    jmp spi_ctrl_done
+spi_fast_m3_byte:
+    bcu_ctrl 0x00
+    bcu_ctrl 0x20
+    bcu_ctrl 0x01
+    jmp spi_fast_m3_prewarm
 
 spi_ctrl_done:
-    ; Restore CS_N high while preserving the mode's clock idle polarity.
     ldi8.l r3, 2
     ld_dmem_b r0, [r3]
     ldi8.l r1, 2
@@ -285,3 +167,327 @@ spi_done_release:
     ldi8.l r0, 1
     st_dmem_b r0, [r3]
     halt
+
+
+.org 192
+spi_fast_m0_clock8:
+    pin_out 0x1, 0x1
+    nop
+spi_fast_m0_clock8_second:
+    pin_out 0x1, 0x0
+    nop
+    dec r1
+    jnz spi_fast_m0_clock8
+    ret
+spi_fast_m0_prewarm:
+    call spi_fast_m0_entry
+spi_fast_m0_start:
+    pin_out 0x5, 0x0
+    bcu_ctrl 0x01
+    bcu_tx r0
+    call spi_fast_m0_entry
+    bcu_rx r0
+    pin_out 0x5, 0x4
+    ret
+
+
+.org 208
+spi_fast_m1_clock8:
+    pin_out 0x1, 0x1
+    nop
+spi_fast_m1_clock8_second:
+    pin_out 0x1, 0x0
+    nop
+    dec r1
+    jnz spi_fast_m1_clock8
+    ret
+spi_fast_m1_prewarm:
+    call spi_fast_m1_entry
+spi_fast_m1_start:
+    pin_out 0x5, 0x0
+    bcu_ctrl 0x01
+    bcu_tx r0
+    call spi_fast_m1_entry
+    bcu_rx r0
+    pin_out 0x5, 0x4
+    ret
+
+
+.org 224
+spi_fast_m2_clock8:
+    pin_out 0x1, 0x0
+    nop
+spi_fast_m2_clock8_second:
+    pin_out 0x1, 0x1
+    nop
+    dec r1
+    jnz spi_fast_m2_clock8
+    ret
+spi_fast_m2_prewarm:
+    call spi_fast_m2_entry
+spi_fast_m2_start:
+    pin_out 0x5, 0x1
+    bcu_ctrl 0x01
+    bcu_tx r0
+    call spi_fast_m2_entry
+    bcu_rx r0
+    pin_out 0x5, 0x5
+    ret
+
+
+.org 240
+spi_fast_m3_clock8:
+    pin_out 0x1, 0x0
+    nop
+spi_fast_m3_clock8_second:
+    pin_out 0x1, 0x1
+    nop
+    dec r1
+    jnz spi_fast_m3_clock8
+    ret
+spi_fast_m3_prewarm:
+    call spi_fast_m3_entry
+spi_fast_m3_start:
+    pin_out 0x5, 0x1
+    bcu_ctrl 0x01
+    bcu_tx r0
+    call spi_fast_m3_entry
+    bcu_rx r0
+    pin_out 0x5, 0x5
+    ret
+
+
+.org 268
+spi_fast_m0_entry:
+    bcu_ctrl 0x03
+    ldi8.l r1, 8
+    jmp spi_fast_m0_clock8
+
+.org 284
+spi_fast_m1_entry:
+    ldi8.l r1, 8
+    pin_out 0x1, 0x1
+    bcu_ctrl 0x03
+    jmp spi_fast_m1_clock8_second
+
+.org 300
+spi_fast_m2_entry:
+    bcu_ctrl 0x03
+    ldi8.l r1, 8
+    jmp spi_fast_m2_clock8
+
+.org 316
+spi_fast_m3_entry:
+    ldi8.l r1, 8
+    pin_out 0x1, 0x0
+    bcu_ctrl 0x03
+    jmp spi_fast_m3_clock8_second
+
+
+.org 336
+
+spi_slow_m0_setup:
+    bcu_ctrl 0x20
+    bcu_ctrl 0x00
+    pin_oe 0x1, 0x1
+    pin_out 0x5, 0x4
+    ldi8.l r3, 8
+    ld_dmem_b r0, [r3]
+    call spi_slow_m0_byte
+    ldi8.l r3, 0x40
+    st_dmem_b r0, [r3]
+    ldi8.l r3, 9
+    ld_dmem_b r0, [r3]
+    call spi_slow_m0_byte
+    ldi8.l r3, 0x41
+    st_dmem_b r0, [r3]
+    jmp spi_ctrl_done
+spi_slow_m0_byte:
+    bcu_ctrl 0x00
+    bcu_ctrl 0x20
+    bcu_ctrl 0x01
+    jmp spi_slow_m0_prewarm
+
+spi_slow_m1_setup:
+    bcu_ctrl 0x20
+    bcu_ctrl 0x00
+    pin_oe 0x1, 0x1
+    pin_out 0x5, 0x4
+    ldi8.l r3, 8
+    ld_dmem_b r0, [r3]
+    call spi_slow_m1_byte
+    ldi8.l r3, 0x40
+    st_dmem_b r0, [r3]
+    ldi8.l r3, 9
+    ld_dmem_b r0, [r3]
+    call spi_slow_m1_byte
+    ldi8.l r3, 0x41
+    st_dmem_b r0, [r3]
+    jmp spi_ctrl_done
+spi_slow_m1_byte:
+    bcu_ctrl 0x00
+    bcu_ctrl 0x20
+    bcu_ctrl 0x01
+    jmp spi_slow_m1_prewarm
+
+spi_slow_m2_setup:
+    bcu_ctrl 0x20
+    bcu_ctrl 0x00
+    pin_oe 0x1, 0x1
+    pin_out 0x5, 0x5
+    ldi8.l r3, 8
+    ld_dmem_b r0, [r3]
+    call spi_slow_m2_byte
+    ldi8.l r3, 0x40
+    st_dmem_b r0, [r3]
+    ldi8.l r3, 9
+    ld_dmem_b r0, [r3]
+    call spi_slow_m2_byte
+    ldi8.l r3, 0x41
+    st_dmem_b r0, [r3]
+    jmp spi_ctrl_done
+spi_slow_m2_byte:
+    bcu_ctrl 0x00
+    bcu_ctrl 0x20
+    bcu_ctrl 0x01
+    jmp spi_slow_m2_prewarm
+
+spi_slow_m3_setup:
+    bcu_ctrl 0x20
+    bcu_ctrl 0x00
+    pin_oe 0x1, 0x1
+    pin_out 0x5, 0x5
+    ldi8.l r3, 8
+    ld_dmem_b r0, [r3]
+    call spi_slow_m3_byte
+    ldi8.l r3, 0x40
+    st_dmem_b r0, [r3]
+    ldi8.l r3, 9
+    ld_dmem_b r0, [r3]
+    call spi_slow_m3_byte
+    ldi8.l r3, 0x41
+    st_dmem_b r0, [r3]
+    jmp spi_ctrl_done
+spi_slow_m3_byte:
+    bcu_ctrl 0x00
+    bcu_ctrl 0x20
+    bcu_ctrl 0x01
+    jmp spi_slow_m3_prewarm
+
+
+.org 448
+
+spi_slow_m0_prewarm:
+    call spi_slow_m0_clock8
+spi_slow_m0_start:
+    pin_out 0x5, 0x0
+    bcu_ctrl 0x01
+    bcu_tx r0
+    call spi_slow_m0_clock8
+    bcu_rx r0
+    pin_out 0x5, 0x4
+    ret
+spi_slow_m0_clock8:
+    bcu_ctrl 0x03
+    ldi8.l r1, 8
+spi_slow_m0_clock8_loop:
+    pin_out 0x1, 0x1
+    set_anchor 0
+    wait_phase r2
+    pin_out 0x1, 0x0
+    set_anchor 0
+    wait_phase r2
+    dec r1
+    jnz spi_slow_m0_clock8_loop
+    ret
+
+
+spi_slow_m1_prewarm:
+    call spi_slow_m1_clock8
+spi_slow_m1_start:
+    pin_out 0x5, 0x0
+    bcu_ctrl 0x01
+    bcu_tx r0
+    call spi_slow_m1_clock8
+    bcu_rx r0
+    pin_out 0x5, 0x4
+    ret
+spi_slow_m1_clock8:
+    ldi8.l r1, 8
+    pin_out 0x1, 0x1
+    bcu_ctrl 0x03
+    set_anchor 0
+    wait_phase r2
+    pin_out 0x1, 0x0
+    set_anchor 0
+    wait_phase r2
+    dec r1
+    jnz spi_slow_m1_clock8_steady
+spi_slow_m1_clock8_steady:
+    pin_out 0x1, 0x1
+    set_anchor 0
+    wait_phase r2
+    pin_out 0x1, 0x0
+    set_anchor 0
+    wait_phase r2
+    dec r1
+    jnz spi_slow_m1_clock8_steady
+    ret
+
+
+spi_slow_m2_prewarm:
+    call spi_slow_m2_clock8
+spi_slow_m2_start:
+    pin_out 0x5, 0x1
+    bcu_ctrl 0x01
+    bcu_tx r0
+    call spi_slow_m2_clock8
+    bcu_rx r0
+    pin_out 0x5, 0x5
+    ret
+spi_slow_m2_clock8:
+    bcu_ctrl 0x03
+    ldi8.l r1, 8
+spi_slow_m2_clock8_loop:
+    pin_out 0x1, 0x0
+    set_anchor 0
+    wait_phase r2
+    pin_out 0x1, 0x1
+    set_anchor 0
+    wait_phase r2
+    dec r1
+    jnz spi_slow_m2_clock8_loop
+    ret
+
+
+spi_slow_m3_prewarm:
+    call spi_slow_m3_clock8
+spi_slow_m3_start:
+    pin_out 0x5, 0x1
+    bcu_ctrl 0x01
+    bcu_tx r0
+    call spi_slow_m3_clock8
+    bcu_rx r0
+    pin_out 0x5, 0x5
+    ret
+spi_slow_m3_clock8:
+    ldi8.l r1, 8
+    pin_out 0x1, 0x0
+    bcu_ctrl 0x03
+    set_anchor 0
+    wait_phase r2
+    pin_out 0x1, 0x1
+    set_anchor 0
+    wait_phase r2
+    dec r1
+    jnz spi_slow_m3_clock8_steady
+spi_slow_m3_clock8_steady:
+    pin_out 0x1, 0x0
+    set_anchor 0
+    wait_phase r2
+    pin_out 0x1, 0x1
+    set_anchor 0
+    wait_phase r2
+    dec r1
+    jnz spi_slow_m3_clock8_steady
+    ret

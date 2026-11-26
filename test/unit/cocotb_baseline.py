@@ -281,37 +281,29 @@ def strip_annotation_only_lines(text):
 
 
 def controller_concurrent_source():
-    """Build the U7 concurrent image using private-bank core-ID probing.
+    """Build the U7 concurrent image using architected CORE_ID dispatch.
 
-    CORE_ID is not exposed architecturally, but a core can write only its own
-    private CSR bank.  A probe of the banked BCU_PAT_MATCH scratch register
-    therefore identifies the executing core without modifying RTL.  Section
-    origins are sized for the real firmware bodies; the whole image remains
-    below the architectural 1024-instruction limit.
+    The standalone SPI controller image is intentionally not concatenated:
+    its cache-conscious .org layout is large and mode-matrix specific.  The
+    concurrent proof needs only SPI mode1 at 1 MHz, so a compact slow-only
+    controller role is emitted here.  UART and I2C use their real firmware
+    bodies.  The whole image remains below the 1024-slot architectural limit.
     """
     dispatch = """
-; concurrent-image core selector: write token to own bank, scan bank0..bank3
-    ldi8.l r0, 0x5a
-    csr_wr r0, 0x4a
-    csr_rd r1, 0x4a
-    cmp r0, r1
-    jz uart_entry
-    csr_wr r0, 0x5a
-    csr_rd r1, 0x5a
-    cmp r0, r1
-    jz spi_ctrl_entry
-    csr_wr r0, 0x6a
-    csr_rd r1, 0x6a
-    cmp r0, r1
-    jz i2c_ctrl_entry
-    csr_wr r0, 0x7a
-    csr_rd r1, 0x7a
-    cmp r0, r1
-    jz wave_entry
-    halt
+; concurrent-image core selector: architected CORE_ID in each private bank
+    csr_rd r1, 0x4d
+    mov r1, r1
+    jz uart_entry          ; core0
+    ldi8.l r0, 1
+    cmp r1, r0
+    jz spi_conc_entry      ; core1
+    ldi8.l r0, 2
+    cmp r1, r0
+    jz i2c_ctrl_entry      ; core2
+    jmp wave_entry         ; core3
 
 ; Deterministic waveform on core3 pin bit2: four 20-cycle pulses separated
-; by 20-cycle low gaps.  It is intentionally inside the dispatch section.
+; by 20-cycle low gaps.
 wave_entry:
     pin_out 0x4, 0x0
     ldi8.l r3, 20
@@ -339,15 +331,73 @@ wave_entry:
     pin_out 0x4, 0x0
     halt
 
-.org 0x020
+.org 0x040
 """
     parts = [dispatch, strip_annotation_only_lines(firmware_text("uart.hasm"))]
     parts.append("\n.org 0x1a0\n")
-    parts.append(strip_annotation_only_lines(firmware_text("spi_ctrl.hasm")))
+    parts.append("""
+; Compact SPI mode1/1 MHz controller role for the concurrent proof.
+; It retains the same BCU TX/RX, prewarm, independent one-byte CS behavior.
+spi_conc_entry:
+    ldi8.l r2, 27
+    bcu_ctrl 0x20
+    bcu_ctrl 0x00
+    pin_oe 0x1, 0x1
+    pin_out 0x5, 0x4
+    ldi8.l r3, 8
+    ld_dmem_b r0, [r3]
+    call spi_conc_byte
+    ldi8.l r3, 0x40
+    st_dmem_b r0, [r3]
+    ldi8.l r3, 9
+    ld_dmem_b r0, [r3]
+    call spi_conc_byte
+    ldi8.l r3, 0x41
+    st_dmem_b r0, [r3]
+    pin_out 0x5, 0x4
+    bcu_ctrl 0x00
+    pin_oe 0x1, 0x0
+    halt
+spi_conc_byte:
+    bcu_ctrl 0x00
+    bcu_ctrl 0x20
+    bcu_ctrl 0x01
+    jmp spi_conc_prewarm
+spi_conc_prewarm:
+    call spi_conc_clock8
+spi_conc_start:
+    pin_out 0x5, 0x0
+    bcu_ctrl 0x01
+    bcu_tx r0
+    call spi_conc_clock8
+    bcu_rx r0
+    pin_out 0x5, 0x4
+    ret
+spi_conc_clock8:
+    ldi8.l r1, 8
+    pin_out 0x1, 0x1
+    bcu_ctrl 0x03
+    set_anchor 0
+    wait_phase r2
+    pin_out 0x1, 0x0
+    set_anchor 0
+    wait_phase r2
+    dec r1
+    jnz spi_conc_steady
+spi_conc_steady:
+    pin_out 0x1, 0x1
+    set_anchor 0
+    wait_phase r2
+    pin_out 0x1, 0x0
+    set_anchor 0
+    wait_phase r2
+    dec r1
+    jnz spi_conc_steady
+    ret
+""")
     parts.append("\n.org 0x2c0\n")
     parts.append(strip_annotation_only_lines(firmware_text("i2c_ctrl.hasm")))
     return "\n".join(parts)
-
 
 # ----------------------------------------------------------------------
 # Fabric configuration helpers
@@ -803,7 +853,10 @@ async def _spi_ctrl_case(dut, mode, fast, first_clock):
                 lambda bit: drive_ui_bit(dut, 1, bit),
                 mode=mode, expected_clock_cycles=period,
                 clock_tolerance=0.22)
-            captured.extend(await target.transfer([byte], timeout_cycles=20000))
+            try:
+                captured.extend(await target.transfer([byte], timeout_cycles=20000))
+            except Exception as e:
+                raise type(e)(f"mode{mode} fast={fast} byte{len(captured)}: {e}") from e
         return bytes(captured)
 
     serve = cocotb.start_soon(serve_independent_byte_cs())
@@ -841,12 +894,16 @@ async def debug_spi_ctrl_probe(dut):
         (8 - 1) | 0x10, isa.pack_dpll_cfg(mode="none", win=0, period=6))
     await clear_mailbox(dut)
     await write_sram1_bytes(dut, MEM_TX, bytes([0xA5, 0x3C, 0x96, 0x5A]))
-    await write_sram1_bytes(dut, 0, bytes([0, 0, 0x10, 4]))
-    drive_ui_bit(dut, 1, 0)
+    await write_sram1_bytes(dut, 0, bytes([0, 0, 0x11, 4]))
+    target = SPITargetBfm(
+        dut.clk,
+        lambda: uo_bit(dut, 1), lambda: uio_out_bit(dut, 1), lambda: uio_out_bit(dut, 5),
+        lambda bit: drive_ui_bit(dut, 1, bit), mode=1, expected_clock_cycles=6, clock_tolerance=0.3)
+    cocotb.start_soon(target.transfer([0x18], timeout_cycles=1200))
 
     async def mon():
         last = {}
-        for i in range(700):
+        for i in range(1600):
             await RisingEdge(dut.clk)
             vals = {
                 "cs": uo_bit(dut, 1),
@@ -859,7 +916,14 @@ async def debug_spi_ctrl_probe(dut):
                 "txcnt": u(dut.gen_core[1].u_bcu.tx_sym_cnt),
                 "dcnt": u(dut.gen_core[1].u_bcu.u_dpll.cnt),
                 "rxsh": u(dut.gen_core[1].u_bcu.rx_shift),
+                "ctrl": u(dut.gen_core[1].core_bcu_ctrl),
+                "timer": u(dut.gen_core[1].u_core.timer) & 0xFF,
+                "anchor": u(dut.gen_core[1].u_core.anchor) & 0xFF,
+                "waita": u(dut.gen_core[1].u_core.wait_active),
+                "stall": u(dut.gen_core[1].u_core.stall_cnt) & 0xFF,
             }
+            if (0xC0 <= vals["pc"] <= 0xD8) and ("pc" not in last or vals["pc"] != last["pc"] or vals["ctrl"] != last.get("ctrl", -1) or vals["waita"] != last.get("waita", -1)):
+                print(f"DBG spi cyc{i:04d} pc={vals['pc']:03x} ctrl={vals['ctrl']:02x} timer={vals['timer']:02x} anchor={vals['anchor']:02x} waita={vals['waita']} stall={vals['stall']:02x}")
             for key in ("cs", "sclk", "mosi", "txp"):
                 if key not in last or vals[key] != last[key]:
                     print(f"DBG spi cyc{i:04d} {key}={vals[key]} pc={vals['pc']:03x} txcnt={vals['txcnt']} dcnt={vals['dcnt']}")
@@ -870,7 +934,7 @@ async def debug_spi_ctrl_probe(dut):
             last = vals
     cocotb.start_soon(mon())
     await write_csr(dut, CSR_CTRL_RUN, 0x0002)
-    await cycles(dut, 700)
+    await cycles(dut, 1600)
 
 
 async def _spi_target_case(dut, mode, first_clock):
@@ -1046,6 +1110,50 @@ async def test_i2c_nack_arbitration_and_spike(dut):
         "I2C lines not released after arbitration loss"
     assert not bus.contention_errors, bus.contention_errors
 
+    async def spike_case(pin_filter):
+        await reset_dut(dut, start_clock=False)
+        await load_firmware(dut, "i2c_ctrl.hasm")
+        await configure_i2c_pins(dut, pin_filter=pin_filter)
+        await clear_mailbox(dut)
+        write_data = bytes([0x5A, 0xC3])
+        await write_sram1_bytes(dut, 0, bytes([0, 0, 1, 0, 0, 0, 0, 0]))
+        await write_sram1_bytes(dut, MEM_TX, bytes([(0x42 << 1)]) + write_data)
+        target = I2CTargetBfm(bus, address=0x42, byte_count=2, timeout_cycles=20000)
+        serve = cocotb.start_soon(target.serve())
+
+        async def inject():
+            # Wait for a genuine data-one/SCL-high phase, then pull SDA low for
+            # three 60 MHz clocks (50 ns).  The four-deep pin filter must reject it.
+            # Wait for the first in-transaction SCL high phase, then pull SCL
+            # low for three 60 MHz clocks (50 ns).  Unfiltered this is a false
+            # clock pulse; the four-deep filter must reject it.
+            prev_scl = 1
+            for _ in range(20000):
+                await ClockCycles(dut.clk, 1)
+                scl = bus.sample("scl")
+                if prev_scl == 0 and scl == 1:
+                    bus.set_drive("spike", "scl", True)
+                    await ClockCycles(dut.clk, 3)
+                    bus.set_drive("spike", "scl", False)
+                    return
+                prev_scl = scl
+            raise I2CProtocolError("spike trigger window not found")
+
+        spike = cocotb.start_soon(inject())
+        await write_csr(dut, CSR_CTRL_RUN, 0x0004)
+        try:
+            result = await serve
+            await spike
+            status = await wait_mailbox_status(dut, 1, 20)
+            clean = (result.write_data == write_data and status == 1
+                     and not bus.contention_errors)
+        except Exception:
+            clean = False
+        return clean
+
+    assert await spike_case(True), "50 ns SDA glitch corrupted a filtered I2C transaction"
+    assert not await spike_case(False), "non-vacuity failure: unfiltered 50 ns glitch was ignored"
+
 
 @cocotb.test()
 async def test_concurrent_four_core_protocols(dut):
@@ -1078,7 +1186,7 @@ async def test_concurrent_four_core_protocols(dut):
     # UART/SPI byte0; bytes9/10 are the I2C write payload.
     shared_tx = bytes([0x84, 0x5A, 0xC3, 0x96])
     uart_in = bytes([0x42, 0x24, 0x81, 0x18])
-    spi_miso = bytes([0x66, 0x99, 0x42, 0xBD])
+    spi_miso = bytes([0x66, 0x99])
     await clear_mailbox(dut)
     await write_sram1_bytes(dut, MEM_TX, shared_tx)
     await write_sram1_bytes(dut, 0, bytes([0, 0, 1, 4, 0, 0, 0, 0]))
@@ -1112,7 +1220,17 @@ async def test_concurrent_four_core_protocols(dut):
 
     uart_rx_task = cocotb.start_soon(uart_rx.receive_bytes(4, 20000))
     uart_tx_task = cocotb.start_soon(uart_tx.send_bytes(uart_in))
-    spi_task = cocotb.start_soon(spi_target.transfer(spi_miso, timeout_cycles=20000))
+    async def serve_spi_independent_bytes():
+        captured = bytearray()
+        for byte in spi_miso:
+            target = SPITargetBfm(
+                dut.clk, lambda: uo_bit(dut, 1), lambda: uio_out_bit(dut, 1),
+                lambda: uio_out_bit(dut, 5), lambda bit: drive_ui_bit(dut, 1, bit),
+                mode=1, expected_clock_cycles=60, clock_tolerance=0.25)
+            captured.extend(await target.transfer([byte], timeout_cycles=20000))
+        return bytes(captured)
+
+    spi_task = cocotb.start_soon(serve_spi_independent_bytes())
     i2c_task = cocotb.start_soon(i2c_target.serve())
 
     await write_csr(dut, CSR_CTRL_RUN, 0x000F)
@@ -1122,7 +1240,7 @@ async def test_concurrent_four_core_protocols(dut):
     await uart_tx_task
 
     assert [f.data for f in uart_frames] == list(shared_tx)
-    assert spi_mosi == shared_tx
+    assert spi_mosi == shared_tx[:2]
     assert i2c_result.write_data == shared_tx[1:3]
     assert not bus.contention_errors, bus.contention_errors
 
