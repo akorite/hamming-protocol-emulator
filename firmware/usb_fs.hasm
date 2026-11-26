@@ -1,0 +1,1184 @@
+; SPDX-FileCopyrightText: 2026 akorite
+; SPDX-License-Identifier: Apache-2.0
+;
+; Hamming USB 1.1 full-speed/low-speed device-side protocol demo.
+;
+; This is deliberately a protocol-emulator slice, not a USB device stack:
+; EP0-style token/data/handshake packet phases only, no enumeration state
+; machine.  Core0 owns the wire and BCU0.  Core1 is the relaxed-time
+; builder/validator assistant.  The split mirrors the proven CAN image:
+; all wire-speed polling/playback is tiny and cache-aligned, while CRC and
+; byte-structure work happens before or after the time-critical phase.
+;
+; Wire plan (fabric configuration is host-side):
+;   uio0 = D+ (BCU0 tx_p/routed input through LUT1)
+;   uio4 = D- (BCU0 tx_n/routed input through LUT0)
+; The RX pair is intentionally cross-connected: BCU rx_prev resets to zero,
+; which is the D- level of idle-J.  TX uses a one-bit invisible-J training
+; pulse while idle so the BCU's internal NRZI level represents the real bus
+; before the first packet bit.  ORCHESTRATOR-CHECK: this relies on tx_level
+; persisting in TXS_IDLE while ctrl bit0 (tx_arm) remains continuously set.
+;
+; SRAM1 byte map:
+;   0x01 status: 0x01 TX done, 0x02 RX valid, 0x04 response sent,
+;                0x10 bad structure/PID, 0x20 CRC error,
+;                0x40 stuff error, 0x80 capture/transaction error
+;   0x02 role:   1 TX token, 2 RX token, 3 IN-token->DATA response,
+;                4 DATA0->handshake response, 5 TX data packet
+;   0x03 speed:  0 full-speed (5 cycles/bit), nonzero low-speed (40)
+;   0x04 TX/response PID byte (host supplied)
+;   0x05 token ADDR(6:0), 0x06 token ENDP(3:0)
+;   0x07 payload length, 0..8
+;   0x08..0x0f payload input bytes
+;   0x20..0x2f RX capture (SYNC first)
+;   0x30 RX capture byte count, 0x31 RX PID, 0x32 ADDR, 0x33 ENDP
+;   0x34 data payload length, 0x35 received CRC field, 0x36 HW CRC low
+;   0x37 BCU status snapshot
+;   0x60..0x6f assistant scratch, 0x70 TX stream byte count
+;   0x80..0x8f built TX packet bytes (natural, unstuffed logical bytes)
+;
+; USB logical packets are byte aligned before hardware stuffing:
+; token = SYNC,PID,ADDR/ENDP,CRC5 (4 bytes); data = SYNC,PID,data,CRC16;
+; handshake = SYNC,PID.  BCU hardware performs NRZI and USB six-ones
+; stuffing/destuffing.  Firmware independently validates CRCs like the
+; proven Ethernet image; hardware CRC is additionally precompensated for
+; the constant SYNC+selected-PID prefix and used only as the real-time
+; response gate.
+;
+; ORCHESTRATOR-CHECK: the real-time CRC preseed values below were derived
+; algebraically and must be verified in RTL: 0x0007 makes CRC5/USB reach
+; 0x1f after SYNC+IN(0x69); 0xd6d7 makes CRC16/USB reach 0xffff after
+; SYNC+DATA0(0xc3).
+
+.protocol usb_fs_ls @clk 60MHz
+.constraint usb_fs_bit_period = 5 cycles at 12Mbps
+.constraint usb_ls_bit_period = 40 cycles at 1.5Mbps
+.constraint usb_response_window = 2..6.5 UI at external bus boundary
+.bcu mode=nrzi, stuff=usb6, dpll=hard_snap
+
+; ======================================================================
+; Architected core dispatch.  Core0 is the wire engine; core1 builds and
+; validates; cores2/3 are unused by this protocol image.
+; ======================================================================
+usb_entry:
+    csr_rd r1, 0x4d
+    mov r1, r1
+    jz usb_wire_core
+    ldi8.l r0, 1
+    cmp r1, r0
+    jz usb_assist_core
+    halt
+
+
+; ======================================================================
+; Core1 assistant: relaxed-time packet builder and validator.
+; ======================================================================
+usb_assist_core:
+    ldi8.l r2, 2
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]      ; role
+    ldi8.l r0, 1
+    cmp r1, r0
+    jz assist_build_token
+    ldi8.l r0, 2
+    cmp r1, r0
+    jz assist_build_token   ; harmless unused stream for RX-only role
+    ldi8.l r0, 3
+    cmp r1, r0
+    jz assist_build_data
+    ldi8.l r0, 4
+    cmp r1, r0
+    jz assist_build_handshake
+    ldi8.l r0, 5
+    cmp r1, r0
+    jz assist_build_data
+    jmp assist_bad_role
+
+assist_build_token:
+    jmp usb_build_token
+assist_build_data:
+    jmp usb_build_data
+assist_build_handshake:
+    jmp usb_build_handshake
+
+assist_publish_built:
+    ldi8.l r0, 1
+    ldi8.h r0, 0
+    csr_wr r0, 0x02         ; EV_SET bit0: TX stream is ready
+
+    ; RX-bearing roles continue as the validator.  TX-only roles stop here.
+    ldi8.l r2, 2
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    ldi8.l r0, 2
+    cmp r1, r0
+    jz assist_wait_capture
+    ldi8.l r0, 3
+    cmp r1, r0
+    jz assist_wait_capture
+    ldi8.l r0, 4
+    cmp r1, r0
+    jz assist_wait_capture
+    halt
+
+assist_wait_capture:
+    ldi8.l r2, 0xff
+    ldi8.h r2, 0xff
+    sync_event 0x2, r2      ; EV1: core0 captured a packet
+    csr_rd r0, 0x01
+    ldi8.l r1, 2
+    ldi8.h r1, 0
+    and r0, r1
+    jz assist_capture_timeout
+    ldi8.l r0, 2
+    ldi8.h r0, 0
+    csr_wr r0, 0x03         ; EV_CLR bit1
+    jmp usb_validate_capture
+
+assist_capture_timeout:
+    ldi8.l r0, 0x80
+    call usb_status_or
+    halt
+assist_bad_role:
+    ldi8.l r0, 0x80
+    call usb_status_or
+    halt
+
+
+; ----------------------------------------------------------------------
+; usb_status_or: input r0 status bits; read/modify/write byte 1.
+; Clobbers r2/r3, preserves r1.
+; ----------------------------------------------------------------------
+usb_status_or:
+    mov r3, r0
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    or r0, r3
+    st_dmem_b r0, [r2]
+    ret
+
+
+; ----------------------------------------------------------------------
+; usb_build_token: build SYNC/PID/ADDR-ENDP/CRC5 at 0x80..0x83.
+; Clobbers all registers.  Uses scratch 0x68/0x69 for the CRC helper.
+; ----------------------------------------------------------------------
+usb_build_token:
+    ldi8.l r1, 0x80
+    ldi8.h r1, 0
+    ldi8.l r0, 0x80
+    ldi8.h r0, 0
+    st_dmem_b r0, [r1]      ; SYNC logical byte 0x80
+    ldi8.l r2, 4
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]      ; host-selected token PID
+    inc r1
+    st_dmem_b r0, [r1]      ; PID at 0x81
+
+    ; tb0 = addr[6:0] | endp0<<7, in scratch 0x68.
+    ldi8.l r2, 5
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r2, 0x7f
+    and r0, r2
+    ldi8.l r2, 0x68
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r2, 6
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]      ; ENDP
+    mov r1, r0
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    and r1, r2              ; endp bit0
+    shl r1
+    shl r1
+    shl r1
+    shl r1
+    shl r1
+    shl r1
+    shl r1                  ; endp0 at bit7
+    ldi8.l r2, 0x68
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    or r0, r1
+    st_dmem_b r0, [r2]
+
+    ; scratch 0x69 = endp bits3..1 (the final three CRC-covered bits).
+    ldi8.l r2, 6
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    shr r0
+    ldi8.l r2, 7
+    ldi8.h r2, 0
+    and r0, r2
+    ldi8.l r2, 0x69
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+
+    call usb_crc5_from_scratch  ; r0 = transmitted CRC5 (final-xored)
+    shl r0
+    shl r0
+    shl r0                  ; CRC bits land at byte1 bits3..7
+    ldi8.l r2, 0x69
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    or r0, r1               ; byte1 = endp[3:1] + crc5<<3
+    ldi8.l r2, 0x83
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r2, 0x68
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r2, 0x82
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 4
+    ldi8.l r2, 0x70
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]      ; stream length
+    jmp assist_publish_built
+
+
+; ----------------------------------------------------------------------
+; usb_build_data: build SYNC/PID/payload/CRC16 at 0x80.  Payload input is
+; 0x08.. and len byte 0x07.  CRC16 bytes are appended little-endian.
+; ----------------------------------------------------------------------
+usb_build_data:
+    ldi8.l r1, 0x80
+    ldi8.h r1, 0
+    ldi8.l r0, 0x80
+    ldi8.h r0, 0
+    st_dmem_b r0, [r1]
+    ldi8.l r2, 4
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r2, 0x81
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+
+    ; Copy payload bytes to 0x82 onward.  Scratch 0x60=count, 0x61=in ptr,
+    ; 0x62=out ptr.
+    ldi8.l r2, 7
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r2, 0x60
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 8
+    ldi8.h r0, 0
+    ldi8.l r2, 0x61
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 0x82
+    ldi8.h r0, 0
+    ldi8.l r2, 0x62
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+usb_copy_payload_loop:
+    ldi8.l r2, 0x60
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    mov r0, r0
+    jz usb_copy_payload_done
+    ldi8.l r2, 0x61
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    ld_dmem_b r0, [r1]
+    ldi8.l r2, 0x62
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    st_dmem_b r0, [r1]
+    inc r1
+    st_dmem_b r1, [r2]
+    ldi8.l r2, 0x61
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    inc r1
+    st_dmem_b r1, [r2]
+    ldi8.l r2, 0x60
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    dec r0
+    st_dmem_b r0, [r2]
+    jmp usb_copy_payload_loop
+usb_copy_payload_done:
+
+    ; CRC16 over the original payload bytes.  Scratch 0x65=count,
+    ; 0x66=byte pointer, then append complement at the output pointer.
+    ldi8.l r2, 7
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r2, 0x65
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 8
+    ldi8.h r0, 0
+    ldi8.l r2, 0x66
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    call usb_crc16_scatter
+    not r0, r0              ; transmitted CRC16 is bitwise complement
+
+    ; append low then high byte at output pointer scratch 0x62
+    mov r3, r0
+    ldi8.l r2, 0x62
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    st_dmem_b r3, [r1]
+    inc r1
+    shr r3
+    shr r3
+    shr r3
+    shr r3
+    shr r3
+    shr r3
+    shr r3
+    shr r3
+    st_dmem_b r3, [r1]
+
+    ; total stream len = payload len + 4
+    ldi8.l r2, 7
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 4
+    ldi8.h r1, 0
+    add r0, r1
+    ldi8.l r2, 0x70
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    jmp assist_publish_built
+
+
+; ----------------------------------------------------------------------
+; usb_build_handshake: SYNC + PID only.  Used by the DATA0 responder.
+; ----------------------------------------------------------------------
+usb_build_handshake:
+    ldi8.l r1, 0x80
+    ldi8.h r1, 0
+    ldi8.l r0, 0x80
+    ldi8.h r0, 0
+    st_dmem_b r0, [r1]
+    ldi8.l r2, 4
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r2, 0x81
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 2
+    ldi8.l r2, 0x70
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    jmp assist_publish_built
+
+
+; ----------------------------------------------------------------------
+; usb_crc5_from_scratch: compute transmitted CRC5 over the 11 token bits.
+; Input scratch bytes: 0x68 = token byte0 (addr6..0,endp0),
+;                      0x69 = endp bits3..1 in bits2..0.
+; Returns r0 = final-xored 5-bit CRC.  Clobbers r1-r3.
+; ----------------------------------------------------------------------
+usb_crc5_from_scratch:
+    ldi8.l r0, 0x1f
+    ldi8.h r0, 0
+    ; low nibble of token byte0
+    ldi8.l r2, 0x68
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    ldi8.l r2, 0x0f
+    and r1, r2
+    call usb_crc5_nibble
+    ; high nibble of token byte0
+    ldi8.l r2, 0x68
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    call usb_crc5_nibble
+    ; final message nibble: endp bits3..1 plus one zero pad bit
+    ldi8.l r2, 0x69
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    ldi8.l r2, 7
+    and r1, r2
+    call usb_crc5_nibble
+    ldi8.l r2, 0x1f
+    xor r0, r2              ; transmitted value is complemented
+    ret
+
+
+; ----------------------------------------------------------------------
+; usb_crc16_scatter: reflected raw CRC16 over bytes described by scratch
+; 0x65=count, 0x66=byte pointer.  Returns raw state in r0 (init 0xffff,
+; no final xor).  Clobbers r1-r3 and advances the scratch pointer.
+; ----------------------------------------------------------------------
+usb_crc16_scatter:
+    ldi8.l r0, 0xff
+    ldi8.h r0, 0xff
+usb_crc16_byte_loop:
+    ldi8.l r2, 0x65
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    mov r1, r1
+    jz usb_crc16_done
+    dec r1
+    st_dmem_b r1, [r2]
+    ldi8.l r2, 0x66
+    ldi8.h r2, 0
+    ld_dmem_b r3, [r2]
+    ld_dmem_b r1, [r3]
+    inc r3
+    st_dmem_b r3, [r2]
+    ldi8.l r2, 0x67
+    ldi8.h r2, 0
+    st_dmem_b r1, [r2]      ; retain byte across the table helper
+    ldi8.l r2, 0x0f
+    and r1, r2
+    call usb_crc16_nibble
+    ldi8.l r2, 0x67
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    shr r1
+    shr r1
+    shr r1
+    shr r1
+    call usb_crc16_nibble
+    jmp usb_crc16_byte_loop
+usb_crc16_done:
+    ret
+
+
+; ----------------------------------------------------------------------
+; Nibble CRC helpers.  r0 is the running raw state; r1 is the wire-order
+; nibble in bits3..0.  Tables live in SRAM0 slots 0x300/0x310.
+; ----------------------------------------------------------------------
+usb_crc5_nibble:
+    xor r0, r1
+    mov r2, r0
+    ldi8.l r3, 0x0f
+    ldi8.h r3, 0
+    and r2, r3
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    ldi8.l r3, 0x80
+    ldi8.h r3, 0x03
+    add r3, r2
+    ld_imem r2, [r3]
+    xor r0, r2
+    ret
+
+usb_crc16_nibble:
+    xor r0, r1
+    mov r2, r0
+    ldi8.l r3, 0x0f
+    ldi8.h r3, 0
+    and r2, r3
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    ldi8.l r3, 0x90
+    ldi8.h r3, 0x03
+    add r3, r2
+    ld_imem r2, [r3]
+    xor r0, r2
+    ret
+
+
+; ----------------------------------------------------------------------
+; usb_validate_capture: relaxed independent firmware validation of the
+; capture at 0x20.  Writes decoded fields and terminal status.
+; ----------------------------------------------------------------------
+usb_validate_capture:
+    ; A sticky BCU stuff error has priority over all structural decode.
+    ldi8.l r2, 0x37
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 8
+    ldi8.h r1, 0
+    and r0, r1
+    jz usb_val_no_stuff
+    ldi8.l r0, 0x40
+    call usb_status_or
+    ret
+usb_val_no_stuff:
+
+    ; Count and SYNC validation: fewer than two bytes cannot even hold
+    ; SYNC+PID.  Check zero and one explicitly (no branch-on-carry exists).
+    ldi8.l r2, 0x30
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    mov r1, r1
+    jz usb_val_bad_structure
+    ldi8.l r0, 1
+    cmp r1, r0
+    jz usb_val_bad_structure
+    ldi8.l r2, 0x20
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 0x80
+    cmp r0, r1
+    jnz usb_val_bad_structure
+
+    ; PID complement check and PID publication.
+    ldi8.l r2, 0x21
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r2, 0x31
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    mov r1, r0
+    ldi8.l r2, 0x0f
+    and r1, r2              ; type low nibble
+    mov r2, r0
+    shr r2
+    shr r2
+    shr r2
+    shr r2                  ; complement high nibble
+    xor r2, r1
+    ldi8.l r3, 0x0f
+    cmp r2, r3
+    jnz usb_val_bad_structure
+
+    ; Dispatch by PID type: 1/9/d token, 3/b data, 2/a/e handshake.
+    mov r0, r1
+    ldi8.l r2, 1
+    cmp r0, r2
+    jz usb_val_token
+    ldi8.l r2, 9
+    cmp r0, r2
+    jz usb_val_token
+    ldi8.l r2, 0x0d
+    cmp r0, r2
+    jz usb_val_token
+    ldi8.l r2, 3
+    cmp r0, r2
+    jz usb_val_data
+    ldi8.l r2, 0x0b
+    cmp r0, r2
+    jz usb_val_data
+    ldi8.l r2, 2
+    cmp r0, r2
+    jz usb_val_handshake
+    ldi8.l r2, 0x0a
+    cmp r0, r2
+    jz usb_val_handshake
+    ldi8.l r2, 0x0e
+    cmp r0, r2
+    jz usb_val_handshake
+    jmp usb_val_bad_structure
+
+usb_val_token:
+    ldi8.l r2, 0x30
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 4
+    cmp r0, r1
+    jnz usb_val_bad_structure
+    ; copy token byte0 and endp bits into the CRC helper scratch
+    ldi8.l r2, 0x22
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r2, 0x68
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r2, 0x23
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 7
+    and r0, r1
+    ldi8.l r2, 0x69
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    call usb_crc5_from_scratch
+    mov r3, r0              ; computed transmitted CRC5
+    ldi8.l r2, 0x23
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    shr r0
+    shr r0
+    shr r0
+    ldi8.l r1, 0x1f
+    and r0, r1              ; received crc bits
+    ldi8.l r2, 0x35
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    cmp r0, r3
+    jnz usb_val_bad_crc
+
+    ; Decode and publish ADDR/ENDP.
+    ldi8.l r2, 0x22
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 0x7f
+    and r0, r1
+    ldi8.l r2, 0x32
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r2, 0x22
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    shr r0
+    shr r0                  ; endp bit0
+    mov r1, r0
+    ldi8.l r2, 0x23
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r3, 7
+    and r0, r3
+    shl r0
+    or r0, r1
+    ldi8.l r2, 0x33
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    jmp usb_val_valid
+
+usb_val_data:
+    ; len = capture_count - 4 payload bytes; legal demo range 0..8.
+    ; A data packet has at least SYNC+PID+CRC16 (four bytes), so 2/3 are bad.
+    ldi8.l r2, 0x30
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 2
+    cmp r0, r1
+    jz usb_val_bad_structure
+    ldi8.l r1, 3
+    cmp r0, r1
+    jz usb_val_bad_structure
+    ldi8.l r1, 4
+    sub r0, r1
+    ldi8.l r2, 0x34
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ; Reject len>=9 using the bit15 wrap of len-9 (same idiom as eth).
+    mov r1, r0
+    ldi8.l r2, 9
+    ldi8.h r2, 0
+    sub r1, r2
+    ldi8.l r2, 0x00
+    ldi8.h r2, 0x80
+    and r1, r2
+    jz usb_val_bad_structure
+
+    ; Validate raw CRC16 residue over payload+received-CRC bytes.
+    ; There are count-2 bytes starting at capture base+2 (0x22).
+    ldi8.l r2, 0x30
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 2
+    sub r0, r1
+    ldi8.l r2, 0x65
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 0x22
+    ldi8.h r0, 0
+    ldi8.l r2, 0x66
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    call usb_crc16_scatter
+    ldi8.l r2, 0x01
+    ldi8.h r2, 0xb0
+    cmp r0, r2              ; USB CRC16 raw residue 0xb001
+    jnz usb_val_bad_crc
+    ; publish received CRC16 (last two capture bytes) for diagnostics
+    ldi8.l r2, 0x30
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    ldi8.l r0, 0x20
+    add r1, r0              ; one past capture end
+    dec r1
+    ld_dmem_b r0, [r1]      ; high CRC byte
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    mov r3, r0
+    dec r1
+    ld_dmem_b r0, [r1]      ; low CRC byte
+    or r0, r3
+    ldi8.l r2, 0x35
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]      ; low byte only; byte 0x36 remains HW debug
+    jmp usb_val_valid
+
+usb_val_handshake:
+    ldi8.l r2, 0x30
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 2
+    cmp r0, r1
+    jnz usb_val_bad_structure
+
+usb_val_valid:
+    ldi8.l r0, 2
+    call usb_status_or
+    ret
+
+usb_val_bad_crc:
+    ldi8.l r0, 0x20
+    call usb_status_or
+    ret
+usb_val_bad_structure:
+    ldi8.l r0, 0x10
+    call usb_status_or
+    ret
+
+
+; ======================================================================
+; Core0 wire engine.  All BCU configuration is private bank 0x40.
+; ======================================================================
+usb_wire_core:
+    bcu_ctrl 0x20           ; soft reset while idle
+    bcu_ctrl 0x00
+
+    ; Wait for core1's builder.  The build is relaxed but bounded well
+    ; below this 65535-cycle timeout.
+    ldi8.l r2, 0xff
+    ldi8.h r2, 0xff
+    sync_event 0x1, r2
+    csr_rd r0, 0x01
+    ldi8.l r1, 1
+    and r0, r1
+    jz wire_builder_timeout
+    ldi8.l r0, 1
+    csr_wr r0, 0x03         ; consume EV0
+
+    ; Speed select: byte3 zero => FS period5, nonzero => LS period40.
+    ldi8.l r2, 3
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    mov r0, r0
+    jnz wire_cfg_ls
+    ldi8.l r0, 0x01         ; hard snap, win0
+    ldi8.h r0, 0x05         ; period 5
+    jmp wire_cfg_dpll
+wire_cfg_ls:
+    ldi8.l r0, 0x01
+    ldi8.h r0, 0x28         ; period 40
+wire_cfg_dpll:
+    csr_wr r0, 0x4c
+
+    ; Mode and CRC setup by role.
+    ldi8.l r2, 2
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    ldi8.l r0, 3
+    cmp r1, r0
+    jz wire_mode_resp_in
+    ldi8.l r0, 4
+    cmp r1, r0
+    jz wire_mode_data_ack
+
+    ; Generic TX/RX NRZI+USB6 differential mode, CRC disabled.
+    ; width field 32 is inert because crc_en=0: 0x83e9.
+    ldi8.l r0, 0xe9
+    ldi8.h r0, 0x83
+    csr_wr r0, 0x44
+    jmp wire_mode_done
+
+wire_mode_resp_in:
+    ; NRZI+USB6+CRC5 reflected/init1/enabled/diff = 0xd089.
+    ldi8.l r0, 0x89
+    ldi8.h r0, 0xd0
+    csr_wr r0, 0x44
+    ldi8.l r0, 0x14
+    ldi8.h r0, 0
+    csr_wr r0, 0x45
+    ldi8.l r0, 0
+    ldi8.h r0, 0
+    csr_wr r0, 0x46
+    ; The CRC seed is written after the NRZI training bit; training is a TX
+    ; bit and would otherwise step this shared CRC engine.
+    jmp wire_mode_done
+
+wire_mode_data_ack:
+    ; NRZI+USB6+CRC16 reflected/init1/enabled/diff = 0xd1e9.
+    ldi8.l r0, 0xe9
+    ldi8.h r0, 0xd1
+    csr_wr r0, 0x44
+    ldi8.l r0, 0x01
+    ldi8.h r0, 0xa0
+    csr_wr r0, 0x45
+    ldi8.l r0, 0
+    ldi8.h r0, 0
+    csr_wr r0, 0x46
+    ; Seed write is likewise deferred until after the training bit.
+
+wire_mode_done:
+    ; Prime the NRZI level with one logical zero transmitted as harmless J.
+    ; Keep tx_arm continuously asserted from here through packet TX; dropping
+    ; it would reset tx_level.  First configure a one-bit transfer.
+    ldi8.l r0, 0
+    ldi8.h r0, 0
+    csr_wr r0, 0x49
+    bcu_ctrl 0x01           ; tx_arm only
+    bcu_tx r0               ; logical 0 -> physical J, no visible edge
+    set_anchor 0
+    wait_phase 100          ; longer than one LS bit; initialization only
+    ldi8.l r0, 7
+    ldi8.h r0, 0
+    csr_wr r0, 0x49         ; normal 8-bit LSB-first transfers
+
+    ; Dispatch the wire role.
+    ldi8.l r2, 2
+    ldi8.h r2, 0
+    ld_dmem_b r1, [r2]
+    ldi8.l r0, 1
+    cmp r1, r0
+    jz wire_tx_only
+    ldi8.l r0, 2
+    cmp r1, r0
+    jz wire_rx_token
+    ldi8.l r0, 3
+    cmp r1, r0
+    jz wire_seed_resp_in
+    ldi8.l r0, 4
+    cmp r1, r0
+    jz wire_seed_data_ack
+    ldi8.l r0, 5
+    cmp r1, r0
+    jz wire_tx_only
+    halt
+
+wire_seed_resp_in:
+    ; ORCHESTRATOR-CHECK: algebraically precompensated SYNC+IN CRC5 seed.
+    ; Write high-zero first, then the low half.
+    ldi8.l r0, 0
+    ldi8.h r0, 0
+    csr_wr r0, 0x48
+    ldi8.l r0, 0x07
+    csr_wr r0, 0x47
+    jmp wire_rx_respond
+
+wire_seed_data_ack:
+    ; ORCHESTRATOR-CHECK: algebraically precompensated SYNC+DATA0 CRC16 seed.
+    ldi8.l r0, 0
+    ldi8.h r0, 0
+    csr_wr r0, 0x48
+    ldi8.l r0, 0xd7
+    ldi8.h r0, 0xd6
+    csr_wr r0, 0x47
+    jmp wire_rx_data_ack
+
+wire_builder_timeout:
+    ldi8.l r0, 0x80
+    call usb_status_or
+    halt
+
+
+; ----------------------------------------------------------------------
+; TX-only entry.  The built stream length is at 0x70, bytes at 0x80.
+; ----------------------------------------------------------------------
+wire_tx_only:
+    call usb_tx_stream
+    ldi8.l r0, 1
+    call usb_status_or
+    halt
+
+
+; ----------------------------------------------------------------------
+; RX token-only entry: capture exactly four bytes (token packet).
+; ----------------------------------------------------------------------
+wire_rx_token:
+    ldi8.l r3, 4
+    ldi8.h r3, 0
+    bcu_ctrl 0x03           ; keep tx_arm bit set while RX is armed
+    jmp usb_rx_capture_start
+
+; ----------------------------------------------------------------------
+; IN-token responder: capture four token bytes then use the final-byte
+; rx_full event as the precise response time reference.
+; ----------------------------------------------------------------------
+wire_rx_respond:
+    ldi8.l r3, 4
+    ldi8.h r3, 0
+    bcu_ctrl 0x03
+    jmp usb_rx_capture_start
+
+; ----------------------------------------------------------------------
+; DATA0 responder: capture SYNC+PID+len payload+two CRC bytes, then emit
+; the prebuilt handshake.  This scoped demo supports DATA0 in real time.
+; ----------------------------------------------------------------------
+wire_rx_data_ack:
+    ldi8.l r2, 7
+    ldi8.h r2, 0
+    ld_dmem_b r3, [r2]
+    ldi8.l r0, 4
+    add r3, r0              ; capture count = payload len + 4
+    ldi8.h r3, 0
+    bcu_ctrl 0x03
+    jmp usb_rx_capture_start
+
+
+; ======================================================================
+; Cache-aligned wire-speed region.  Keep every hot service loop within
+; eight SRAM0 words (16 slots) after an 8-word boundary.
+; ======================================================================
+; usb_tx_stream: relaxed entry, then a compact cache-resident playback loop.
+; ORCHESTRATOR-CHECK: this image currently relies on the loops being short
+; enough to avoid direct-map self-conflict without a fixed .org boundary;
+; verify the final assembled addresses and re-align if the integrator needs
+; a stricter proof.
+; Input stream bytes at 0x80, count at 0x70.  Clobbers r0-r3.
+usb_tx_stream:
+    ldi8.l r2, 0x70
+    ldi8.h r2, 0
+    ld_dmem_b r2, [r2]      ; total byte count
+    ldi8.l r1, 0x80
+    ldi8.h r1, 0
+    bcu_ctrl 0x09           ; tx_arm | tx_eop_req (tx_arm remains set)
+    ld_dmem_b r0, [r1]
+    bcu_tx r0               ; first byte enters serializer directly
+    inc r1
+    dec r2
+    ld_dmem_b r0, [r1]
+    bcu_tx r0               ; second byte fills the shadow
+    inc r1
+    dec r2
+    mov r2, r2
+    jz usb_tx_final_wait_entry
+    ldi8.l r3, 0x10
+    ldi8.h r3, 0            ; tx_empty mask
+    jmp usb_tx_pb_poll
+
+; Continuation used after a time-critical first byte has already been
+; pushed by a response path.  r1/r2/r3 are not live at entry.
+usb_tx_after_first:
+    ldi8.l r2, 0x70
+    ldi8.h r2, 0
+    ld_dmem_b r2, [r2]
+    dec r2                  ; one byte already serialized
+    ldi8.l r1, 0x81
+    ldi8.h r1, 0
+    mov r2, r2
+    jz usb_tx_final_wait_entry
+    ld_dmem_b r0, [r1]
+    bcu_tx r0
+    inc r1
+    dec r2
+    mov r2, r2
+    jz usb_tx_final_wait_entry
+    ldi8.l r3, 0x10
+    ldi8.h r3, 0
+    jmp usb_tx_pb_poll
+
+; The hot loop: eight data bytes span at least 40 cycles at FS, generous
+; compared with this nine-instruction service path.
+usb_tx_pb_poll:
+    bcu_stat r0
+    and r0, r3
+    jz usb_tx_pb_poll
+    ld_dmem_b r0, [r1]
+    bcu_tx r0
+    inc r1
+    dec r2
+    jnz usb_tx_pb_poll
+usb_tx_final_wait_entry:
+    ldi8.l r3, 0x10
+    ldi8.h r3, 0
+usb_tx_final_wait:
+    bcu_stat r0
+    and r0, r3
+    jz usb_tx_final_wait
+    ; The final empty event marks the start of the last byte, not the end.
+    ; 500 cycles covers data-byte plus 3-bit EOP at both FS and LS.
+    set_anchor 0
+    ldi8.l r0, 0xf4
+    ldi8.h r0, 0x01         ; 500 cycles
+    wait_phase r0
+    ret
+
+
+; ----------------------------------------------------------------------
+; RX hot capture loop.  r1=store pointer, r2=rx_full mask, r3=count.
+; The final byte is deliberately left in r0 and not stored; each role's
+; final path chooses between a time-critical response and relaxed store.
+; ----------------------------------------------------------------------
+usb_rx_capture_start:
+    ldi8.l r1, 0x20
+    ldi8.h r1, 0
+    ldi8.l r2, 0x20
+    ldi8.h r2, 0
+usb_rx_poll:
+    bcu_stat r0
+    and r0, r2
+    jz usb_rx_poll
+    bcu_rx r0
+    dec r3
+    jz usb_rx_final_role
+    st_dmem_b r0, [r1]
+    inc r1
+    jmp usb_rx_poll
+
+usb_rx_final_role:
+    ; Distinguish the three capture users.  Role byte is still in SRAM.
+    mov r3, r0              ; preserve final byte while reading role
+    ldi8.l r2, 2
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    mov r2, r0
+    mov r0, r3
+    ldi8.l r3, 3
+    cmp r2, r3
+    jz usb_resp_in_final
+    ldi8.l r3, 4
+    cmp r2, r3
+    jz usb_data_ack_final
+    jmp usb_rx_store_final
+
+; Relaxed completion path shared by RX-only and rejected responders.
+usb_rx_store_final:
+    st_dmem_b r0, [r1]
+    ldi8.l r2, 2
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 4
+    cmp r0, r1
+    jz usb_rx_store_count_data
+    ldi8.l r0, 4
+    jmp usb_rx_store_count
+usb_rx_store_count_data:
+    ldi8.l r2, 7
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 4
+    add r0, r1
+usb_rx_store_count:
+    ldi8.l r2, 0x30
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    bcu_stat r0
+    ldi8.l r2, 0x37
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    bcu_crc_rd r0, lo
+    ldi8.l r2, 0x36
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 2
+    ldi8.h r0, 0
+    csr_wr r0, 0x02         ; EV_SET bit1: capture ready
+    halt
+
+; Critical IN response path.  rx_full for the final CRC5 bit occurs 2.5 UI
+; before the host's SE0->J transition.  Validate the hardware precompensated
+; residue and schedule the first push for approximately 4 UI after that
+; transition, comfortably inside USB's 2..6.5 UI device window.
+usb_resp_in_final:
+    st_dmem_b r0, [r1]      ; preserve final token byte before validation
+    set_anchor 0            ; detection-time deadline reference
+    bcu_crc_rd r2, lo
+    ldi8.l r3, 6
+    cmp r2, r3              ; raw CRC5 residue for valid token
+    jnz usb_resp_reject
+    ldi8.l r1, 0x80
+    ldi8.h r1, 0
+    ld_dmem_b r0, [r1]      ; first response byte ready before the wait
+    ldi8.l r3, 32           ; ORCHESTRATOR-CHECK: tune after RTL observation
+    wait_phase r3
+    bcu_ctrl 0x09           ; rx off, tx remains armed, request USB EOP
+    bcu_tx r0
+    call usb_tx_after_first
+    ldi8.l r0, 4
+    call usb_status_or      ; response-sent bit
+    jmp usb_rx_finish_after_response
+
+usb_resp_reject:
+    ; No response.  Capture is already stored; publish it for validation.
+    jmp usb_rx_finish_after_response
+
+usb_rx_finish_after_response:
+    ldi8.l r0, 4
+    ldi8.l r2, 0x30
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    bcu_stat r0
+    ldi8.l r2, 0x37
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    bcu_crc_rd r0, lo
+    ldi8.l r2, 0x36
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 2
+    ldi8.h r0, 0
+    csr_wr r0, 0x02
+    halt
+
+; Critical DATA0->handshake response path.  Same timing reference as the
+; IN responder, but the hardware gate is the standard raw CRC16 residue.
+usb_data_ack_final:
+    st_dmem_b r0, [r1]
+    set_anchor 0
+    bcu_crc_rd r2, lo
+    ldi8.l r3, 0x01
+    ldi8.h r3, 0xb0
+    cmp r2, r3              ; raw CRC16 residue 0xb001
+    jnz usb_dataack_reject
+    ldi8.l r1, 0x80
+    ldi8.h r1, 0
+    ld_dmem_b r0, [r1]
+    ldi8.l r3, 32           ; ORCHESTRATOR-CHECK: tune after RTL observation
+    wait_phase r3
+    bcu_ctrl 0x09
+    bcu_tx r0
+    call usb_tx_after_first
+    ldi8.l r0, 4
+    call usb_status_or
+    jmp usb_dataack_finish
+
+usb_dataack_reject:
+    jmp usb_dataack_finish
+
+usb_dataack_finish:
+    ; Recover the configured capture length: payload len + 4.
+    ldi8.l r2, 7
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r1, 4
+    add r0, r1
+    ldi8.l r2, 0x30
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    bcu_stat r0
+    ldi8.l r2, 0x37
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    bcu_crc_rd r0, lo
+    ldi8.l r2, 0x36
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 2
+    ldi8.h r0, 0
+    csr_wr r0, 0x02
+    halt
+
+
+; ======================================================================
+; CRC nibble tables in SRAM0 table space.  CRC5 entries are four-step
+; reflected transforms for poly 0x14/width5; CRC16 entries are the standard
+; reflected poly 0xa001 nibble transforms.  ORCHESTRATOR-CHECK: CRC5 table
+; is hand-derived and should be vector-checked during integration.
+; ======================================================================
+.org 0x380
+usb_crc5_table:
+    .word 0x0000,0x0016,0x0005,0x0013,0x000a,0x001c,0x000f,0x0019
+    .word 0x0014,0x0002,0x0011,0x0007,0x001e,0x0008,0x001b,0x000d
+
+.org 0x390
+usb_crc16_table:
+    .word 0x0000,0xcc01,0xd801,0x1400,0xf001,0x3c00,0x2800,0xe401
+    .word 0xa001,0x6c00,0x7800,0xb401,0x5000,0x9c01,0x8801,0x4400

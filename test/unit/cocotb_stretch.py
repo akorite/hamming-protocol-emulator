@@ -28,6 +28,7 @@ from cocotb_baseline import (  # noqa: E402
     SRC_CORE,
     SRC_BCU_P,
     SRC_BCU_N,
+    SRC_BCU_OE,
     clear_mailbox,
     configure_waveform_pin,  # noqa: F401  (re-exported for MITM use)
     core_status,
@@ -58,6 +59,10 @@ from bfm.can_bfm import (  # noqa: E402
 )
 from bfm.eth_bfm import (  # noqa: E402
     Eth10BaseTNode, EthWire, EthernetProtocolError, mutate_fcs_bits,
+)
+from bfm.usb_bfm import (  # noqa: E402
+    PID_ACK, PID_DATA0, PID_IN, USBBus, USBDeviceReceiver, USBHostBfm,
+    token_packet_bytes, wire_levels_for_packet,
 )
 
 
@@ -525,3 +530,172 @@ async def diag_can_tx_probe(dut):
     print(f"DIAG: core3 status = {st3:#x} (bit4 halted={((st3>>4)&1)})")
     pc3 = await read_csr(dut, isa.CSR_CORE_BANK + 3 * 16 + isa.CORE_CSR["CORE_PC"])
     print(f"DIAG: core3 pc = {pc3:#x}")
+
+
+# ----------------------------------------------------------------------
+# USB 1.1 LS/FS fabric and mailbox helpers.  uio0 is D+, uio4 is D-; both
+# channels are congruent modulo four and therefore pair directly with BCU0.
+# LUT0 supplies BCU rx_p from D- (required by the RTL's reset rx_prev=0),
+# while LUT1 supplies rx_n from D+.
+# ----------------------------------------------------------------------
+USB_DP_PIN = 0
+USB_DM_PIN = 4
+USB_ROLE_TX_TOKEN = 1
+USB_ROLE_RX_TOKEN = 2
+USB_ROLE_RESPOND_IN = 3
+USB_ROLE_DATA_ACK = 4
+USB_ROLE_TX_DATA = 5
+
+
+async def configure_usb_pins(dut):
+    await write_pin_router(dut, {
+        USB_DP_PIN: SRC_BCU_P,
+        USB_DM_PIN: SRC_BCU_N,
+        8 + USB_DP_PIN: SRC_BCU_OE,
+        8 + USB_DM_PIN: SRC_BCU_OE,
+    })
+    await write_lut(dut, 0, lut_tt_identity_in0(), (USB_DM_PIN, 15, 15, 15))
+    await write_lut(dut, 1, lut_tt_identity_in0(), (USB_DP_PIN, 15, 15, 15))
+
+
+def make_usb_bus(dut):
+    bus = USBBus(
+        dut.clk,
+        lambda level: drive_uio_bit(dut, USB_DP_PIN, level),
+        lambda level: drive_uio_bit(dut, USB_DM_PIN, level),
+        lambda: uio_out_bit(dut, USB_DP_PIN),
+        lambda: uio_out_bit(dut, USB_DM_PIN),
+        lambda: uio_oe_bit(dut, USB_DP_PIN),
+        lambda: uio_oe_bit(dut, USB_DM_PIN),
+    )
+    bus.start_resolver()
+    return bus
+
+
+async def usb_setup(dut, role, speed=0, pid=PID_IN, addr=5, endp=0,
+                    payload=b"", handshake_pid=PID_ACK):
+    await reset_dut(dut, start_clock=True)
+    await load_firmware(dut, "usb_fs.hasm")
+    await configure_usb_pins(dut)
+    await clear_mailbox(dut)
+    # role,speed,pid,addr,endp,len at bytes2..7; payload input at byte8.
+    hdr = bytes([role, speed, pid if role != USB_ROLE_DATA_ACK else handshake_pid,
+                 addr, endp, len(payload)])
+    await write_sram1_bytes(dut, 2, hdr)
+    if payload:
+        await write_sram1_bytes(dut, 8, bytes(payload))
+    bus = make_usb_bus(dut)
+    bit_cycles = 5 if speed == 0 else 40
+    host = USBHostBfm(bus, bit_cycles=bit_cycles)
+    receiver = USBDeviceReceiver(bus, bit_cycles=bit_cycles)
+    await write_csr(dut, CSR_CTRL_RUN, 0x0003)  # USB core0 wire + core1 assistant
+    await cycles(dut, 160)  # relaxed builder plus one-bit NRZI training pulse
+    return bus, host, receiver
+
+
+async def usb_assert_no_device_packet(dut, bus, cycles_count=120):
+    for _ in range(cycles_count):
+        await cycles(dut, 1)
+        assert bus.line != "K", "device started a packet despite invalid host traffic"
+    assert not bus.contention_errors, bus.contention_errors
+
+
+@cocotb.test()
+async def test_usb_tx_token(dut):
+    """DUT transmits a complete NRZI/stuffed/token-CRC5 packet."""
+    bus, _host, receiver = await usb_setup(
+        dut, USB_ROLE_TX_TOKEN, pid=PID_IN, addr=5, endp=0)
+    got = await receiver.capture_packet()
+    assert got.kind == "token"
+    assert got.pid == PID_IN
+    assert got.addr == 5 and got.endp == 0
+    status = await wait_mailbox_status(dut, 0x01, 20)
+    assert status & 0x01
+    assert not bus.contention_errors, bus.contention_errors
+
+
+@cocotb.test()
+async def test_usb_rx_token(dut):
+    """DUT captures and firmware-validates OUT/IN/SETUP-style token bytes."""
+    bus, host, _receiver = await usb_setup(dut, USB_ROLE_RX_TOKEN)
+    await host.send_token(pid=PID_IN, addr=5, endp=0)
+    status = await wait_mailbox_status(dut, 0x02, 30)
+    assert status & 0x02
+    got = await read_sram1_bytes(dut, 0x30, 6)
+    assert got[0] == 4, f"USB token capture count {got[0]}"
+    assert got[1] == PID_IN
+    assert got[2] == 5 and got[3] == 0
+    assert not bus.contention_errors, bus.contention_errors
+
+
+@cocotb.test()
+async def test_usb_response_window(dut):
+    """IN token elicits DATA0 in the USB 2..6.5 UI turnaround window."""
+    payload = bytes([0xFF, 0xFF])  # forces real USB bit stuffing in the response
+    bus, host, receiver = await usb_setup(
+        dut, USB_ROLE_RESPOND_IN, pid=PID_DATA0, payload=payload)
+    sent = await host.send_token(pid=PID_IN, addr=5, endp=0)
+    got = await receiver.capture_packet(reference_j_cycle=sent.j_cycle)
+    assert got.kind == "data" and got.pid == PID_DATA0
+    assert got.payload == payload
+    assert got.stuff_positions, "response did not exercise bit stuffing"
+    ui_cycles = got.latency_cycles / 5.0
+    assert 2.0 <= ui_cycles <= 6.5,         f"USB response latency {got.latency_cycles} cycles ({ui_cycles:.2f} UI)"
+    status = await wait_mailbox_status(dut, 0x04, 30)
+    assert status & 0x04
+    assert not bus.contention_errors, bus.contention_errors
+
+
+@cocotb.test()
+async def test_usb_crc5_err(dut):
+    """Corrupted token CRC5 is rejected and produces no device response."""
+    bus, host, _receiver = await usb_setup(
+        dut, USB_ROLE_RESPOND_IN, pid=PID_DATA0, payload=b"A")
+    await host.send_token(pid=PID_IN, addr=5, endp=0, crc_mutate=0)
+    status = await wait_mailbox_status(dut, 0x20, 30)
+    assert status & 0x20
+    await usb_assert_no_device_packet(dut, bus, 100)
+
+
+@cocotb.test()
+async def test_usb_crc16_err(dut):
+    """Corrupted DATA0 CRC16 is rejected; no ACK handshake is emitted."""
+    payload = bytes([1, 2, 3])
+    bus, host, _receiver = await usb_setup(
+        dut, USB_ROLE_DATA_ACK, payload=payload, handshake_pid=PID_ACK)
+    await host.send_data(payload, pid=PID_DATA0, crc_mutate=0)
+    status = await wait_mailbox_status(dut, 0x20, 30)
+    assert status & 0x20
+    await usb_assert_no_device_packet(dut, bus, 100)
+
+
+@cocotb.test()
+async def test_usb_stuff_err(dut):
+    """A seventh consecutive one raises the BCU sticky stuff-error status."""
+    payload = bytes([0xFF, 0xFF, 0xFF])
+    packet = bytes([0x80, PID_DATA0]) + payload + b"\x00\x00"
+    _levels, positions = wire_levels_for_packet(packet)
+    assert positions, "non-vacuous stuff-error mutation requires a stuff bit"
+    bus, host, _receiver = await usb_setup(
+        dut, USB_ROLE_DATA_ACK, payload=payload, handshake_pid=PID_ACK)
+    await host.send_data(payload, pid=PID_DATA0, stuff_error=True)
+    status = await wait_mailbox_status(dut, 0x40, 30)
+    assert status & 0x40
+    await usb_assert_no_device_packet(dut, bus, 100)
+
+
+@cocotb.test()
+async def test_usb_ls_smoke(dut):
+    """Low-speed smoke: one DUT TX token and one DUT RX token at 40 cycles/UI."""
+    bus, _host, receiver = await usb_setup(
+        dut, USB_ROLE_TX_TOKEN, speed=1, pid=PID_IN, addr=3, endp=0)
+    got = await receiver.capture_packet(timeout_cycles=40000)
+    assert got.kind == "token" and got.addr == 3
+    assert not bus.contention_errors, bus.contention_errors
+
+    bus, host, _receiver = await usb_setup(
+        dut, USB_ROLE_RX_TOKEN, speed=1)
+    await host.send_token(pid=PID_IN, addr=3, endp=0)
+    status = await wait_mailbox_status(dut, 0x02, 30)
+    assert status & 0x02
+    assert not bus.contention_errors, bus.contention_errors
