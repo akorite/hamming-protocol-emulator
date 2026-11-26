@@ -1,0 +1,450 @@
+; SPDX-FileCopyrightText: 2026 akorite
+; SPDX-License-Identifier: Apache-2.0
+;
+; Hamming CAN 2.0A firmware (1 Mbps, 60 cycles/bit at 60 MHz).
+;
+; Architecture: a bitstream BUILDER runs at relaxed timing before the frame
+; and lays the fully stuffed wire bit sequence into an SRAM scratch buffer
+; (one byte per bit, 0 = dominant, nonzero = recessive), computing the
+; MSB-first CRC-15 (poly 0x4599) on chip in the process.  A tiny PLAYBACK
+; loop -- small enough to stay resident in the 8-line loop cache -- then
+; bits the buffer onto the wire at exact 60-cycle spacing using cumulative
+; deadline timing.  This split exists because live per-bit CRC+stuffing
+; work cannot fit the 60-cycle window through the direct-mapped icache,
+; while the playback loop easily can.  Two recessive dummy bits are built
+; at the front of the buffer: they are invisible idle time on the wire but
+; warm the playback loop's cache lines before the SOF edge.
+;
+; Pin plan: single-wire CAN on uio3, owned by core3 (uio3 pairs to core3
+; bit0 for data and OE).  Open-drain style: dominant = oe pull-down,
+; recessive = release; core_out bit0 stays 0.
+;
+; Mailbox (SRAM1 bytes):
+;   1     status: 1 = done+ACKed / frame-valid+ACKed, 0x11 never ACKed,
+;                 0x20 RX CRC mismatch, 0x10 RX stuff error, 0x40 arb lost
+;   2     role: 1 = transmit one frame, 2 = receive one frame
+;   3     dlc (0..8)
+;   4     identifier bits 7..0
+;   5     identifier bits 10..8
+;   8..   TX payload bytes
+;   0x30  RX identifier lo, 0x31 hi, 0x32 dlc, 0x35 RX acked flag
+;   0x40..RX payload bytes
+;
+; Builder scratch: csr 0x79/0x7a/0x7b/0x7c (core3 BCU config registers,
+; benign while the BCU is idle in this pure-firmware protocol):
+;   0x7a  stuffing state: bit3 run_val, bits[2:0] run_len
+;   0x7b  16-bit packing scratch
+;   0x7c  builder bit countdown
+;   0x79  builder data byte pointer / outer count
+;   0x80..0xef  bitstream buffer, one byte per wire bit, through CRC delim
+
+.protocol can20a @clk 60MHz
+.constraint can_bit_period = 60 cycles at 1Mbps
+
+can_entry:
+    csr_rd r1, 0x4d
+    ldi8.l r0, 3
+    cmp r1, r0
+    jz can_dispatch
+    halt
+can_dispatch:
+    pin_out 0x1, 0x0        ; data bit low; oe performs the pull-down
+    pin_oe 0x1, 0x0         ; released = recessive idle
+    ldi8.l r1, 2
+    ld_dmem_b r0, [r1]
+    ldi8.l r1, 1
+    cmp r0, r1
+    jz can_tx_entry
+    ldi8.l r1, 2
+    cmp r0, r1
+    jz can_rx_entry
+    halt
+
+
+; ======================================================================
+; Transmit role, phase 1: build the stuffed bitstream at relaxed timing.
+;   r0 = field shift register / scratch
+;   r1 = crc-15 left-aligned (bit15 = top)
+;   r2 = current bit << 15 / scratch
+;   r3 = buffer write pointer
+; ======================================================================
+can_tx_entry:
+    ldi8.l r1, 0
+    ldi8.h r1, 0            ; crc = 0
+    ldi8.l r3, 0x80
+    ldi8.h r3, 0            ; buffer pointer
+    ldi8.l r0, 0
+    ldi8.l r2, 0x72
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]      ; stuffing state = 0
+
+    ; ---- two invisible recessive warm-up bits (raw, no crc/stuff) ----
+    ldi8.l r0, 1
+    st_dmem_b r0, [r3]
+    inc r3
+    ldi8.l r0, 1
+    st_dmem_b r0, [r3]
+    inc r3
+
+    ; ---- SOF: dominant ----
+    ldi8.l r2, 0
+    ldi8.h r2, 0
+    call emit_bit
+
+    ; ---- identifier, 11 bits MSB first ----
+    ; pack r0 = (idhi << 13) | (idlo << 5) so bit15 is transmitted first
+    ldi8.l r2, 4
+    ld_dmem_b r0, [r2]      ; idlo
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0                  ; idlo << 5 (bits 12..5)
+    csr_wr r0, 0x7a         ; park partial (0x7a is full-width)
+    ldi8.l r2, 5
+    ld_dmem_b r0, [r2]      ; idhi (0..7)
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0                  ; idhi << 13 (bits 15..13)
+    mov r2, r0
+    csr_rd r0, 0x7a         ; partial was parked in 0x7a
+    or r0, r2               ; left-aligned identifier
+    csr_wr r0, 0x7a         ; shift register home
+    ldi8.l r2, 11
+    ldi8.h r2, 0
+    ldi8.l r0, 0x68
+    ldi8.h r0, 0
+    st_dmem_b r2, [r0]      ; bit countdown in memory
+tx_id_loop:
+    call bshl               ; r2 = MSB<<15, r0 <<= 1
+    call emit_bit
+    csr_rd r2, 0x7c
+    dec r2
+    csr_wr r2, 0x7c
+    jnz tx_id_loop
+
+    ; ---- RTR=0, IDE=0, r0=0: three dominant bits ----
+    ldi8.l r2, 0
+    ldi8.h r2, 0
+    call emit_bit
+    ldi8.l r2, 0
+    ldi8.h r2, 0
+    call emit_bit
+    ldi8.l r2, 0
+    ldi8.h r2, 0
+    call emit_bit
+
+    ; ---- DLC, 4 bits MSB first: r0 = dlc << 12 ----
+    ldi8.l r2, 3
+    ld_dmem_b r0, [r2]
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0                  ; dlc << 12 (bit3 at bit15)
+    csr_wr r0, 0x7a
+    ldi8.l r2, 4
+    ldi8.h r2, 0
+    ldi8.l r0, 0x68
+    ldi8.h r0, 0
+    st_dmem_b r2, [r0]
+tx_dlc_loop:
+    call bshl
+    call emit_bit
+    ldi8.l r2, 0x68
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    dec r0
+    st_dmem_b r0, [r2]
+    mov r0, r0
+    jnz tx_dlc_loop
+
+    ; ---- data bytes ----
+    ldi8.l r2, 3
+    ld_dmem_b r2, [r2]      ; dlc = byte count
+    mov r2, r2
+    jz tx_crc_build         ; zero-length payload
+    ldi8.l r0, 0x74
+    ldi8.h r0, 0
+    st_dmem_b r2, [r0]      ; bytes remaining in memory
+    ldi8.l r2, 8
+    ldi8.h r2, 0
+    ldi8.l r0, 0x75
+    ldi8.h r0, 0
+    st_dmem_b r2, [r0]      ; data byte pointer = 8 in memory scratch
+tx_data_byte:
+    ldi8.l r2, 0x75
+    ldi8.h r2, 0
+    ld_dmem_b r2, [r2]      ; byte pointer
+    ld_dmem_b r0, [r2]      ; data byte
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0
+    shl r0                  ; left-aligned: bit7 at bit15
+    csr_wr r0, 0x7a
+    ldi8.l r2, 8
+    ldi8.h r2, 0
+    ldi8.l r0, 0x68
+    ldi8.h r0, 0
+    st_dmem_b r2, [r0]      ; inner bit countdown
+tx_data_bit:
+    call bshl
+    call emit_bit
+    ldi8.l r2, 0x68
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    dec r0
+    st_dmem_b r0, [r2]
+    mov r0, r0
+    jnz tx_data_bit
+    ldi8.l r2, 0x75
+    ldi8.h r2, 0
+    ld_dmem_b r2, [r2]
+    inc r2
+    ldi8.l r0, 0x75
+    ldi8.h r0, 0
+    st_dmem_b r2, [r0]      ; next byte pointer
+    ldi8.l r2, 0x74
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    dec r0
+    st_dmem_b r0, [r2]
+    mov r0, r0
+    jnz tx_data_byte
+
+tx_crc_build:
+    ; ---- CRC field: 15 bits MSB first, copied from r1 ----
+    ; The bits are stuffed on the wire but feeding them back into r1 is
+    ; harmless because the crc accumulator is dead after the data field;
+    ; emission sources the copy in r0.
+    csr_wr r1, 0x7a         ; crc copy is the shift register
+    ldi8.l r2, 15
+    ldi8.h r2, 0
+    ldi8.l r0, 0x68
+    ldi8.h r0, 0
+    st_dmem_b r2, [r0]
+tx_crc_loop:
+    call bshl
+    call emit_bit
+    ldi8.l r2, 0x68
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    dec r0
+    st_dmem_b r0, [r2]
+    mov r0, r0
+    jnz tx_crc_loop
+
+    ; ---- CRC delimiter: recessive, unstuffed (raw store) ----
+    ldi8.l r0, 1
+    st_dmem_b r0, [r3]
+    inc r3
+
+    ; ---- playback bit count = r3 - 0x80, kept in csr 0x7b ----
+    ldi8.l r0, 0x80
+    ldi8.h r0, 0
+    sub r3, r0              ; r3 = total playback bit count
+    ldi8.l r2, 0x76
+    ldi8.h r2, 0
+    st_dmem_b r3, [r2]      ; count fits one byte (< 120)
+
+; ======================================================================
+; Transmit role, phase 2: playback at exact 60-cycle timing.
+;   r0 = scratch, r1 = buffer pointer, r2 = bits remaining,
+;   r3 = cumulative deadline offset (starts with first-bit slack)
+; ======================================================================
+    ldi8.l r1, 0x80
+    ldi8.h r1, 0
+    ldi8.l r2, 0x76
+    ldi8.h r2, 0
+    ld_dmem_b r2, [r2]      ; bits remaining
+    ldi8.l r3, 120
+    ldi8.h r3, 0            ; first-deadline slack for cold cache
+    set_anchor 0
+pb_loop:
+    ld_dmem_b r0, [r1]      ; next wire bit
+    inc r1
+    mov r0, r0              ; z = dominant (stored 0)
+    jz pb_dom
+    pin_oe 0x1, 0x0         ; recessive: release
+    jmp pb_tm
+pb_dom:
+    pin_oe 0x1, 0x1         ; dominant: pull low
+pb_tm:
+    ldi8.l r0, 60
+    add r3, r0
+    wait_phase r3
+    dec r2
+    jnz pb_loop
+
+    ; ---- ACK slot: release, sample mid-bit ----
+    pin_oe 0x1, 0x0
+    ldi8.l r0, 30
+    add r3, r0
+    wait_phase r3
+    pin_in r0, 3            ; wire sample: 0 = dominant = acknowledged
+    ldi8.l r2, 0x35
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 30
+    add r3, r0
+    wait_phase r3
+
+    ; ---- ACK delimiter + EOF: 8 recessive bits ----
+    ldi8.l r2, 8
+    ldi8.h r2, 0
+tx_eof_loop:
+    pin_oe 0x1, 0x0
+    ldi8.l r0, 60
+    add r3, r0
+    wait_phase r3
+    dec r2
+    jnz tx_eof_loop
+
+    ; ---- status from the ACK sample ----
+    ldi8.l r2, 0x35
+    ld_dmem_b r0, [r2]
+    mov r0, r0
+    jz tx_status_ok         ; read 0 -> dominant -> acked
+    ldi8.l r0, 0x11
+    jmp tx_status_wr
+tx_status_ok:
+    ldi8.l r0, 1
+tx_status_wr:
+    ldi8.l r2, 1
+    st_dmem_b r0, [r2]
+    pin_oe 0x1, 0x0
+    halt
+
+
+; ======================================================================
+; bshl: r2 = MSB of r0 presented as bit<<15; r0 <<= 1.  The 0x8000 mask
+; doubles as the one-bit representation.  Clobbers r2 only.
+; ======================================================================
+bshl:
+    csr_rd r0, 0x7a         ; shift register: the only full-width csr scratch
+    ldi8.l r2, 0
+    ldi8.h r2, 0x80
+    and r2, r0
+    shl r0
+    csr_wr r0, 0x7a
+    ret
+
+; ======================================================================
+; emit_bit: append one stuffable CRC-covered bit to the buffer.
+;   input r2 = bit<<15; r1 crc, r3 buffer pointer; clobbers r0, r2
+; ======================================================================
+emit_bit:
+    ; ---- crc step first: inject bit (r2 = bit<<15) into crc r1 ----
+    xor r1, r2              ; bit15 of r1 = top ^ bit (fb)
+    ldi8.l r0, 0
+    ldi8.h r0, 0x80
+    and r0, r1              ; z = (fb == 0)
+    jz emit_shift
+    shl r1
+    ldi8.l r0, 0x32
+    ldi8.h r0, 0x8b         ; poly 0x4599 << 1 = 0x8b32
+    xor r1, r0
+    jmp emit_norm
+emit_shift:
+    shl r1
+emit_norm:
+    ; ---- normalize bit to 0/1 in r0 and store the wire byte ----
+    mov r2, r2              ; z = dominant (r2 still bit<<15)
+    jz emit_zero
+    ldi8.l r0, 1
+    jmp emit_store
+emit_zero:
+    ldi8.l r0, 0
+emit_store:
+    st_dmem_b r0, [r3]
+    inc r3
+    ; ---- park the 0/1 bit for stuffing; r2 free now (crc consumed) ----
+    ldi8.l r2, 0x6c
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    ; ---- stuffing state update; mem byte 0x72: bit3 run_val, [2:0] len --
+    ldi8.l r2, 0x72
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]      ; r0 = state
+    ldi8.l r2, 0x6c
+    ldi8.h r2, 0
+    ld_dmem_b r2, [r2]      ; r2 = emitted bit (0 or 1)
+    mov r2, r2              ; z = dominant
+    jnz es_one
+    ; ---- emitted bit is 0 ----
+    ldi8.l r2, 0x08
+    and r2, r0              ; nonzero => run_val == 1 (run broken)
+    jnz es_newz
+    inc r0                  ; continue zero run
+    jmp es_wr
+es_newz:
+    ldi8.l r0, 0x01         ; new run: len 1, val 0
+    ldi8.h r0, 0
+    jmp es_wr
+es_one:
+    ; ---- emitted bit is 1 ----
+    ldi8.l r2, 0x08
+    and r2, r0              ; nonzero => run_val == 1 (run continues)
+    jnz es_con1
+    ldi8.l r0, 0x09         ; new run: len 1, val 1
+    ldi8.h r0, 0
+    jmp es_wr
+es_con1:
+    inc r0                  ; continue one run
+es_wr:
+    ldi8.l r2, 0x72
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]      ; state updated
+    ; ---- insertion check: run_len == 5? ----
+    ldi8.l r2, 0x07
+    and r2, r0              ; run_len
+    ldi8.l r0, 5
+    ldi8.h r0, 0
+    cmp r2, r0              ; z = (run_len == 5)
+    jnz emit_done
+    ; ---- insert the complement stuff bit as the next buffer byte ----
+    ldi8.l r2, 0x72
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    ldi8.l r2, 0x08
+    and r2, r0              ; nonzero => run_val 1 -> stuff bit dominant
+    jnz es_ins_dom
+    ldi8.l r0, 1            ; run of zeros -> recessive stuff bit
+    jmp es_ins_store
+es_ins_dom:
+    ldi8.l r0, 0
+es_ins_store:
+    st_dmem_b r0, [r3]
+    inc r3
+    ldi8.l r0, 0
+    ldi8.l r2, 0x72
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]      ; run state cleared
+emit_done:
+    ret
+
+; ======================================================================
+; Receive role -- placeholder, implemented after TX is green.
+; ======================================================================
+can_rx_entry:
+    halt
