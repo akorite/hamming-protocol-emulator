@@ -95,3 +95,35 @@ docs/isa + ISS model + all firmware that reads CSRs (CORE_ID at 0xD!).
   ×1.865 cmos5l inflation factor, SRAM dims, and area budgeting.
   flow/pe_soc.json uses SYNTH_STRATEGY AREA 3 + max-buffer-pct 100 resizer
   settings.
+
+
+## Measured results (2026-11-26 evening)
+
+- CSR diet COMMITTED AND MEASURED: utilization 94.449% -> 86.978%
+  (mapped cell area 940k -> 905k um2). Verified in gds CI run
+  45858892850. Still fails GRT-0010 (unplaced instance) at GPL.
+- AREA 3 synthesis strategy: REJECTED, doubled mapped area to 2.08M
+  um2 / 106.5% utilization (logic replication for timing).
+- LEFT/RIGHT_MARGIN_MULT 6 -> 2: REJECTED, utilization barely moved
+  (86.98% -> 86.82%), core area only +2.7k um2. The die geometry is
+  essentially fixed; margins are not the lever. Reverted.
+- Placement becomes physically feasible only at roughly <= 82%
+  utilization (tt-ihp-vga-trng hardened at 82.7% per reference notes).
+  Current gap: ~5 points of utilization ~ 60k um2 of cell area.
+
+## Remaining levers, ranked
+
+1. Core barrel-shifter / ALU mux diet: cores hold 760 muxes each
+   x4 = 3040 total. The ISA shl/shr/sha barrel paths are the densest
+   known remaining mux clusters. Any restriction (e.g. iterative
+   shift microcode) is an ISA-visible change - evaluate carefully.
+2. lut_matrix crossbar: 856 muxes in the pin routing fabric. The
+   crossbar is inherently muxy; a sparser routing pattern (fewer
+   simultaneous source options) would cut it but reduces routing
+   flexibility - check which source combinations the demos use.
+3. FF diet: cmos5l FF = ~49 um2 vs ~4 in sg13g2. 4677 FFs ~ 229k um2.
+   CSR bank storage and wide control registers are candidates.
+4. The 28k minimum-buffer mapping explosion: buf_1 count 27,776 is
+   still unexplained - investigate whether synthesis slew/fanout
+   constraints are forcing buffer trees, and whether relaxing them
+   (STA signoff is anyway a separate gate) recovers area.
