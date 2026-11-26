@@ -25,8 +25,12 @@ Timing model (per the KTD2/KTD3 bounds in docs/plans):
 Host-side helpers: `sram0_write()` models a host SRAM 0 commit (invalidates
 the loop cache and drops an in-flight fill), `host_csr_write()` bypasses the
 core's private-bank write restriction, `icache_inv_all()` is the RTL
-`icache_inv_all` strobe.  `ev_flags`, `timer`, `sram0`, `sram1`, `csr`,
-`lut_tt`, `lut_sel` and `bcu` are plain attributes the test may read/stub.
+`icache_inv_all` strobe.  Core CSR reads are narrower than host CSR reads:
+core `k` sees its own private bank plus `EV_FLAGS`/`TIMER_LO`/`TIMER_HI`;
+foreign banks (except the architectural `CORE_ID` readback) and host-only
+LUT/RLE/pin-router configuration read as zero.  `ev_flags`, `timer`,
+`sram0`, `sram1`, `csr`, `lut_tt`, `lut_sel` and `bcu` are plain attributes
+the test may read/stub.
 """
 
 from collections import deque
@@ -497,17 +501,25 @@ class HammingISS:
         self._csr_write(ops["addr"], self.regs[ops["rs"]])
 
     def _csr_read(self, addr):
+        # The only globally readable core CSRs are the event flags and the
+        # shared timer.  All other global/RLE/pin-router/LUT state is host-only
+        # and reads as zero on a core port.
         if addr == isa.CSR["EV_FLAGS"]:
             return self.ev_flags
         if addr == isa.CSR["TIMER_LO"]:
             return self.timer & 0xFFFF
         if addr == isa.CSR["TIMER_HI"]:
             return (self.timer >> 16) & 0xF
-        if (isa.CSR_CORE_BANK <= addr < 0x80 and
-                (addr & 0xF) == isa.CORE_CSR["CORE_ID"]):
-            return self.core_id
-        off = addr - (isa.CSR_CORE_BANK + 16 * self.core_id)
-        if 0 <= off < 16:
+
+        if isa.CSR_CORE_BANK <= addr < 0x80:
+            off = addr & 0xF
+            # CORE_ID is the architectural role-dispatch exception: a core
+            # reading offset D in any bank still receives its own index.
+            if off == isa.CORE_CSR["CORE_ID"]:
+                return self.core_id
+            bank = (addr - isa.CSR_CORE_BANK) >> 4
+            if bank != self.core_id:
+                return 0
             if off == isa.CORE_CSR["CORE_STATUS"]:
                 return (self.z | (self.c << 1) | (self.eq << 2) |
                         (self.deadline_missed << 3) | (int(self.halted) << 4))
@@ -529,7 +541,12 @@ class HammingISS:
                 return self.bcu.crc_poly & 0xFFFF
             if off == isa.CORE_CSR["BCU_CRC_POLY_HI"]:
                 return (self.bcu.crc_poly >> 16) & 0xFFFF
-        return self.csr[addr]
+            # Writable configuration in the owned bank (BCU_MODE, BIT_LEN,
+            # PAT_MATCH/PAT_LEN, DPLL_CFG) is stored in the flat CSR array.
+            return self.csr[addr]
+
+        # Every remaining address is outside the core-visible CSR subset.
+        return 0
 
     def _csr_write(self, addr, val):
         val &= 0xFFFF

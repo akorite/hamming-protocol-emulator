@@ -19,3 +19,5 @@ formal/*/
 test/unit/results.xml
 formal/*_run*.log
 formal/*/status.sqlite
+firmware/*.bin
+firmware/*.hex

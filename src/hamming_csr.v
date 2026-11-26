@@ -25,7 +25,7 @@ module hamming_csr (
     input  wire [31:0] core_waddr_flat,  // 4 x 8-bit write addresses
     input  wire [63:0] core_wdata_flat,  // 4 x 16-bit write data
     input  wire [31:0] core_raddr_flat,  // 4 x 8-bit read addresses
-    output reg  [63:0] core_rdata_flat,  // 4 x 16-bit read data
+    output wire [63:0] core_rdata_flat,  // 4 x 16-bit read data
 
     input  wire [63:0] core_status_flat,
     input  wire [39:0] core_pc_flat,
@@ -133,80 +133,125 @@ module hamming_csr (
       assign bcu_dpll_cfg_flat[go*16 +: 16]   = {bcu_dpll_cfg_r[go][13:2], 2'b00, bcu_dpll_cfg_r[go][1:0]};
       assign bcu_tx_data_flat[go*16 +: 16] = 16'h0000;
     end
-  endgenerate
 
-  integer read_port;
-  integer read_bank;
-  reg [7:0] read_addr;
-  reg [15:0] read_value;
+    // Core read ports are deliberately narrower than the host port.  Core k
+    // sees its own private bank, the shared event flags, and the shared timer;
+    // foreign-bank data, host configuration, RLE/pin-router state, and the LUT
+    // programming page read as zero.  Offset CORE_ID is the one cross-bank
+    // exception: reading offset D in any per-core bank returns the reading
+    // core's own index, which is the architectural role-dispatch mechanism.
+    // Because the bank number is the generate constant go, all private-bank
+    // references below elaborate to direct wires rather than cross-bank muxes.
+    for (go = 0; go < 4; go = go + 1) begin : gen_core_read_decode
+      localparam [1:0] CORE_ID_BITS = (go == 0) ? 2'd0 :
+                                      (go == 1) ? 2'd1 :
+                                      (go == 2) ? 2'd2 : 2'd3;
+      localparam [3:0] OWN_BANK_NIBBLE = {2'b01, CORE_ID_BITS};
 
-  // Decode all five zero-stall read ports in one combinational block. Keeping
-  // the decode inline (rather than behind a function) is deliberate Verilog-
-  // 2005 style: every storage element below is directly visible to @*.
-  always @* begin
-    host_rdata = 16'h0000;
-    core_rdata_flat = 64'h0000000000000000;
-    for (read_port = 0; read_port < 5; read_port = read_port + 1) begin
-      if (read_port == 0)
-        read_addr = host_addr;
-      else
-        read_addr = core_raddr_flat[(read_port-1)*8 +: 8];
+      wire [7:0]  core_read_addr;
+      wire        core_bank_page;
+      wire        core_own_bank;
+      reg  [15:0] core_read_value;
 
-      read_value = 16'h0000;
-      if (read_addr >= CSR_CORE_BANK && read_addr < 8'h80) begin
-        read_bank = (read_addr - CSR_CORE_BANK) >> 4;
-        case (read_addr[3:0])
-          4'h0: read_value = core_status_flat[read_bank*16 +: 16];
-          4'h1: read_value = {6'b000000, core_pc_flat[read_bank*10 +: 10]};
-          4'h2: read_value = {12'b0, core_out_flat[read_bank*4 +: 4]};
-          4'h3: read_value = {12'b0, core_oe_flat[read_bank*4 +: 4]};
-          4'h4: read_value = bcu_mode_r[read_bank];
-          4'h5: read_value = bcu_crc_poly_r[read_bank][15:0];
-          4'h6: read_value = bcu_crc_poly_r[read_bank][31:16];
-          4'h7: read_value = bcu_crc_live_flat[read_bank*32 +: 16];
-          4'h8: read_value = bcu_crc_live_flat[read_bank*32+16 +: 16];
-          4'h9: read_value = {11'b0, bcu_bit_len_r[read_bank]};
-          4'hA: read_value = bcu_pat_match_r[read_bank];
-          4'hB: read_value = {12'b0, bcu_pat_len_r[read_bank]};
-          4'hC: read_value = {bcu_dpll_cfg_r[read_bank][13:2], 2'b00, bcu_dpll_cfg_r[read_bank][1:0]};
-          4'hD: read_value = (read_port == 0) ? read_bank : (read_port - 1);
-          4'hE: read_value = bcu_rx_data_flat[read_bank*16 +: 16];
-          4'hF: read_value = bcu_stat_flat[read_bank*16 +: 16];
-          default: read_value = 16'h0000;
-        endcase
-      end else if (read_addr >= CSR_LUT_TT_BASE && read_addr < CSR_LUT_SEL_BASE) begin
-        read_value = lut_tt_r[read_addr - CSR_LUT_TT_BASE];
-      end else if (read_addr >= CSR_LUT_SEL_BASE && read_addr < CSR_LUT_OREG) begin
-        read_value = lut_sel_r[read_addr - CSR_LUT_SEL_BASE];
-      end else begin
-        case (read_addr)
-          CSR_CTRL_RUN:      read_value = {12'b0, ctrl_run_r};
-          CSR_EV_FLAGS:      read_value = {8'b0, ev_flags_r};
-          CSR_TIMER_LO:      read_value = timer_r[15:0];
-          CSR_TIMER_HI:      read_value = {12'b0, timer_r[19:16]};
-          CSR_RLE_BASE:      read_value = {7'b0, rle_base_r};
-            CSR_RLE_CTRL:      read_value = {9'b0, rle_ctrl_r};
-            CSR_RLE_PROBE_MASK: read_value = rle_probe_mask_r;
-          CSR_RLE_MASK:      read_value = {7'b0, rle_mask_r};
-          CSR_RLE_WR_PTR:    read_value = rle_wr_ptr;
-          CSR_RLE_STATUS:    read_value = rle_status;
-          CSR_PIN_FILT_EN:   read_value = {8'b0, pin_filt_en_r};
-          CSR_OPEN_DRAIN_EN: read_value = {8'b0, open_drain_en_r};
-          CSR_PIN_ROUTER0:   read_value = pin_router_r[0];
-          CSR_PIN_ROUTER0+1: read_value = pin_router_r[1];
-          CSR_PIN_ROUTER0+2: read_value = pin_router_r[2];
-          CSR_PIN_ROUTER0+3: read_value = pin_router_r[3];
-          CSR_PIN_ROUTER0+4: read_value = pin_router_r[4];
-          CSR_PIN_ROUTER0+5: read_value = pin_router_r[5];
-          CSR_LUT_OREG:      read_value = lut_oreg_r;
-          default:           read_value = 16'h0000;
-        endcase
+      assign core_read_addr = core_raddr_flat[go*8 +: 8];
+      assign core_bank_page = (core_read_addr[7:6] == 2'b01);
+      assign core_own_bank  = (core_read_addr[7:4] == OWN_BANK_NIBBLE);
+
+      always @* begin
+        core_read_value = 16'h0000;
+        if (core_bank_page) begin
+          if (core_read_addr[3:0] == 4'hD) begin
+            core_read_value = {14'h000, CORE_ID_BITS};
+          end else if (core_own_bank) begin
+            case (core_read_addr[3:0])
+              4'h0: core_read_value = core_status_flat[go*16 +: 16];
+              4'h1: core_read_value = {6'b000000, core_pc_flat[go*10 +: 10]};
+              4'h2: core_read_value = {12'b0, core_out_flat[go*4 +: 4]};
+              4'h3: core_read_value = {12'b0, core_oe_flat[go*4 +: 4]};
+              4'h4: core_read_value = bcu_mode_r[go];
+              4'h5: core_read_value = bcu_crc_poly_r[go][15:0];
+              4'h6: core_read_value = bcu_crc_poly_r[go][31:16];
+              4'h7: core_read_value = bcu_crc_live_flat[go*32 +: 16];
+              4'h8: core_read_value = bcu_crc_live_flat[go*32+16 +: 16];
+              4'h9: core_read_value = {11'b0, bcu_bit_len_r[go]};
+              4'hA: core_read_value = bcu_pat_match_r[go];
+              4'hB: core_read_value = {12'b0, bcu_pat_len_r[go]};
+              4'hC: core_read_value = {bcu_dpll_cfg_r[go][13:2], 2'b00, bcu_dpll_cfg_r[go][1:0]};
+              4'hE: core_read_value = bcu_rx_data_flat[go*16 +: 16];
+              4'hF: core_read_value = bcu_stat_flat[go*16 +: 16];
+              default: core_read_value = 16'h0000;
+            endcase
+          end
+        end else begin
+          case (core_read_addr)
+            CSR_EV_FLAGS:      core_read_value = {8'b0, ev_flags_r};
+            CSR_TIMER_LO:      core_read_value = timer_r[15:0];
+            CSR_TIMER_HI:      core_read_value = {12'b0, timer_r[19:16]};
+            default:           core_read_value = 16'h0000;
+          endcase
+        end
       end
 
-      if (read_port == 0)
-        host_rdata = read_value;
-      else
-        core_rdata_flat[(read_port-1)*16 +: 16] = read_value;
+      assign core_rdata_flat[go*16 +: 16] = core_read_value;
+    end
+  endgenerate
+
+  integer host_read_bank;
+
+  // The host retains the full cross-bank debug/readback view.  Keeping this
+  // decode as a single port is intentional: the four restricted core ports
+  // above no longer replicate these variable bank and LUT index muxes.
+  always @* begin
+    host_rdata = 16'h0000;
+    host_read_bank = 0;
+    if (host_addr >= CSR_CORE_BANK && host_addr < 8'h80) begin
+      host_read_bank = (host_addr - CSR_CORE_BANK) >> 4;
+      case (host_addr[3:0])
+        4'h0: host_rdata = core_status_flat[host_read_bank*16 +: 16];
+        4'h1: host_rdata = {6'b000000, core_pc_flat[host_read_bank*10 +: 10]};
+        4'h2: host_rdata = {12'b0, core_out_flat[host_read_bank*4 +: 4]};
+        4'h3: host_rdata = {12'b0, core_oe_flat[host_read_bank*4 +: 4]};
+        4'h4: host_rdata = bcu_mode_r[host_read_bank];
+        4'h5: host_rdata = bcu_crc_poly_r[host_read_bank][15:0];
+        4'h6: host_rdata = bcu_crc_poly_r[host_read_bank][31:16];
+        4'h7: host_rdata = bcu_crc_live_flat[host_read_bank*32 +: 16];
+        4'h8: host_rdata = bcu_crc_live_flat[host_read_bank*32+16 +: 16];
+        4'h9: host_rdata = {11'b0, bcu_bit_len_r[host_read_bank]};
+        4'hA: host_rdata = bcu_pat_match_r[host_read_bank];
+        4'hB: host_rdata = {12'b0, bcu_pat_len_r[host_read_bank]};
+        4'hC: host_rdata = {bcu_dpll_cfg_r[host_read_bank][13:2], 2'b00, bcu_dpll_cfg_r[host_read_bank][1:0]};
+        4'hD: host_rdata = {14'h000, host_read_bank[1:0]};
+        4'hE: host_rdata = bcu_rx_data_flat[host_read_bank*16 +: 16];
+        4'hF: host_rdata = bcu_stat_flat[host_read_bank*16 +: 16];
+        default: host_rdata = 16'h0000;
+      endcase
+    end else if (host_addr >= CSR_LUT_TT_BASE && host_addr < CSR_LUT_SEL_BASE) begin
+      host_rdata = lut_tt_r[host_addr - CSR_LUT_TT_BASE];
+    end else if (host_addr >= CSR_LUT_SEL_BASE && host_addr < CSR_LUT_OREG) begin
+      host_rdata = lut_sel_r[host_addr - CSR_LUT_SEL_BASE];
+    end else begin
+      case (host_addr)
+        CSR_CTRL_RUN:       host_rdata = {12'b0, ctrl_run_r};
+        CSR_EV_FLAGS:       host_rdata = {8'b0, ev_flags_r};
+        CSR_TIMER_LO:       host_rdata = timer_r[15:0];
+        CSR_TIMER_HI:       host_rdata = {12'b0, timer_r[19:16]};
+        CSR_RLE_BASE:       host_rdata = {7'b0, rle_base_r};
+        CSR_RLE_CTRL:       host_rdata = {9'b0, rle_ctrl_r};
+        CSR_RLE_PROBE_MASK: host_rdata = rle_probe_mask_r;
+        CSR_RLE_MASK:       host_rdata = {7'b0, rle_mask_r};
+        CSR_RLE_WR_PTR:     host_rdata = rle_wr_ptr;
+        CSR_RLE_STATUS:     host_rdata = rle_status;
+        CSR_PIN_FILT_EN:    host_rdata = {8'b0, pin_filt_en_r};
+        CSR_OPEN_DRAIN_EN:  host_rdata = {8'b0, open_drain_en_r};
+        CSR_PIN_ROUTER0:    host_rdata = pin_router_r[0];
+        CSR_PIN_ROUTER0+1:  host_rdata = pin_router_r[1];
+        CSR_PIN_ROUTER0+2:  host_rdata = pin_router_r[2];
+        CSR_PIN_ROUTER0+3:  host_rdata = pin_router_r[3];
+        CSR_PIN_ROUTER0+4:  host_rdata = pin_router_r[4];
+        CSR_PIN_ROUTER0+5:  host_rdata = pin_router_r[5];
+        CSR_LUT_OREG:       host_rdata = lut_oreg_r;
+        default:            host_rdata = 16'h0000;
+      endcase
     end
   end
 
