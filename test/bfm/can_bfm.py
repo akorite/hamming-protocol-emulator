@@ -265,8 +265,15 @@ class CANNodeBfm:
         self.bit_cycles = int(bit_cycles)
         self.sample_at = max(2, int(round(bit_cycles * sample_point)))
 
-    async def send_frame(self, identifier, data, rtr=0):
-        """Transmit one conforming frame and sample the ACK slot midpoint.
+    async def send_frame(self, identifier, data, rtr=0, wire_bits_override=None):
+        """Transmit one frame and sample the ACK slot midpoint.
+
+        `wire_bits_override` is a test-only mutation hook: it must be a
+        complete encoded wire-bit sequence with the same trailer structure.
+        The frame layout arguments still identify the nominal frame and the
+        returned CRC, while the bits physically driven are exactly the
+        override.  This lets negative tests corrupt CRC/stuffing without
+        teaching the mutation or receiver logic anything about the DUT.
 
         Bits are driven for the full bit time; the wire is released during
         the ACK slot so a peer can acknowledge.  Implements bitwise
@@ -277,8 +284,12 @@ class CANNodeBfm:
         Returns (acked, lost_arbitration, crc).
         """
         wire_bits, crc, _ = encode_frame_bits(identifier, data, rtr)
+        if wire_bits_override is not None:
+            wire_bits = list(wire_bits_override)
         n = len(wire_bits)
-        ack_index = n - 8     # ACK slot position in the sequence
+        # The ten unstuffed trailer bits are CRC delimiter, ACK slot, ACK
+        # delimiter, then EOF[6:0].  Hence the ACK slot is n-9 (not n-8).
+        ack_index = n - 9
         # Unstuffed positions of the arbitration field: SOF+ID+RTR = 13
         # leading unstuffed bits.  Map each wire position to its unstuffed
         # index (stuff bits have no index).
@@ -431,9 +442,30 @@ class CANNodeBfm:
                 acked_valid = (crc_rx == crc)
                 state = "ack_slot"
                 if drive_ack and acked_valid:
-                    self.bus.set_drive(self.owner, True)  # dominant ACK
+                    # The CRC delimiter sample is at bit center.  The ACK
+                    # slot starts half a bit later.  Use a bounded 40-cycle
+                    # pulse centered in that slot: it never intrudes into
+                    # the recessive CRC delimiter, is unambiguously in-slot,
+                    # and releases before the ACK delimiter.  Keeping the
+                    # pulse in a child coroutine preserves the parent's
+                    # exact one-sample-per-bit recovery schedule.
+                    async def ack_pulse():
+                        # At the CRC-delimiter sample instant there are
+                        # bit_cycles-sample_at cycles left in that bit.  Use
+                        # a two-cycle margin at both ends: dominant for 56
+                        # cycles entirely inside the 60-cycle ACK slot.
+                        margin = 2
+                        await ClockCycles(
+                            self.clk,
+                            self.bit_cycles - self.sample_at + margin)
+                        self.bus.set_drive(self.owner, True)
+                        await ClockCycles(
+                            self.clk, self.bit_cycles - 2 * margin)
+                        self.bus.set_drive(self.owner, False)
+                    cocotb.start_soon(ack_pulse())
             elif state == "ack_slot":
-                self.bus.set_drive(self.owner, False)
+                # The independently scheduled pulse above owns drive/release
+                # timing; this sample only advances the frame state.
                 state = "ack_delim"
             elif state == "ack_delim":
                 if bit != RECESSIVE:

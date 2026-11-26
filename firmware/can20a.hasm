@@ -30,13 +30,11 @@
 ;   0x30  RX identifier lo, 0x31 hi, 0x32 dlc, 0x35 RX acked flag
 ;   0x40..RX payload bytes
 ;
-; Builder scratch: csr 0x79/0x7a/0x7b/0x7c (core3 BCU config registers,
-; benign while the BCU is idle in this pure-firmware protocol):
-;   0x7a  stuffing state: bit3 run_val, bits[2:0] run_len
-;   0x7b  16-bit packing scratch
-;   0x7c  builder bit countdown
-;   0x79  builder data byte pointer / outer count
-;   0x80..0xef  bitstream buffer, one byte per wire bit, through CRC delim
+; TX builder scratch (SRAM1 bytes): 0x68 countdown, 0x6c emitted bit,
+; 0x72 stuffing state, 0x74/0x75 data count/pointer, 0x76 playback count,
+; 0x80..  TX bitstream buffer.  RX uses 0x81.. pair capture (pair P at
+; 0x80+P), 0xf1/0xf2/0xf3 extraction state, 0xf6 ACK marker, 0xf7 BCU
+; status.  csr 0x7a is only the TX builder's full-width shift-register home.
 
 .protocol can20a @clk 60MHz
 .constraint can_bit_period = 60 cycles at 1Mbps
@@ -46,6 +44,9 @@ can_entry:
     ldi8.l r0, 3
     cmp r1, r0
     jz can_dispatch
+    ldi8.l r0, 2
+    cmp r1, r0
+    jz can_assist_dispatch
     halt
 can_dispatch:
     pin_out 0x1, 0x0        ; data bit low; oe performs the pull-down
@@ -58,6 +59,37 @@ can_dispatch:
     ldi8.l r1, 2
     cmp r0, r1
     jz can_rx_entry
+    halt
+
+; Core2 RX assistant.  It has no real-time capture duties, so it can parse
+; DLC with a cache-unfriendly but simple routine and publish the adjusted
+; final pair address.  Core3 raises EV0 when it observes SOF; 1300 cycles
+; later logical bit20 (and therefore every DLC bit) has certainly been
+; sampled even with zero stuffing, while the earliest possible final CRC
+; bit is still more than 700 cycles away.
+can_assist_dispatch:
+    ldi8.l r1, 2
+    ld_dmem_b r0, [r1]
+    ldi8.l r1, 2
+    cmp r0, r1
+    jz can_rx_assist
+    halt
+can_rx_assist:
+    ldi8.l r2, 0xff
+    ldi8.h r2, 0xff
+    sync_event 0x1, r2
+    ldi8.l r0, 0x14
+    ldi8.h r0, 0x05        ; 1300 cycles from the SOF-detect re-anchor
+    wait_phase r0
+    call rx_read_dlc       ; r1 = DLC (pair bytes are quiescent enough now)
+    shl r1
+    shl r1                 ; 4*dlc
+    ldi8.l r0, 17 + 0x80
+    ldi8.h r0, 0
+    add r1, r0             ; final pair count + capture base 0x80
+    ldi8.l r0, 0xf3
+    ldi8.h r0, 0
+    st_dmem_b r1, [r0]
     halt
 
 
@@ -128,9 +160,12 @@ can_tx_entry:
 tx_id_loop:
     call bshl               ; r2 = MSB<<15, r0 <<= 1
     call emit_bit
-    csr_rd r2, 0x7c
-    dec r2
-    csr_wr r2, 0x7c
+    ldi8.l r2, 0x68
+    ldi8.h r2, 0
+    ld_dmem_b r0, [r2]
+    dec r0
+    st_dmem_b r0, [r2]
+    mov r0, r0
     jnz tx_id_loop
 
     ; ---- RTR=0, IDE=0, r0=0: three dominant bits ----
@@ -444,7 +479,438 @@ emit_done:
     ret
 
 ; ======================================================================
-; Receive role -- placeholder, implemented after TX is green.
+; Receive role: BCU-assisted bit capture with firmware frame sequencing.
+;
+; The BCU is configured for NRZ + CAN five-bit destuffing + MSB-first
+; CRC-15.  Its hard-snap DPLL locks on the SOF edge and samples every wire
+; bit at the nominal center.  The crucial framing trick is xfr_len=2:
+; every CAN 2.0A frame contains 34+8*DLC logical bits through the end of
+; the CRC field, an always-even count, so an rx_full event for a two-bit
+; group occurs exactly on the final CRC bit when the group count reaches
+; 17+4*DLC.  The firmware therefore does not need to track stuffing in
+; real time; it counts pair events in a three-instruction poll loop,
+; parses DLC after pair 10, and uses the target pair event as the exact
+; final-CRC-bit timing reference.  Disarming RX at that event freezes the
+; CRC residue before delimiter/ACK/EOF recessive bits can enter it.
+;
+; Pair bytes are stored at SRAM1 byte 0 onward.  In RX role those input
+; mailbox bytes are dead, so this scratch use is safe; outputs are written
+; only after all needed pair bits have been consumed.
 ; ======================================================================
 can_rx_entry:
+    pin_out 0x1, 0x0
+    pin_oe 0x1, 0x0         ; released while receiving
+
+    ; ---- BCU3 configuration (private bank base 0x70) ----
+    ; mode: nrz, can5 destuffing, CRC-15 MSB-first enabled = 0x49d0
+    ldi8.l r0, 0xd0
+    ldi8.h r0, 0x49
+    csr_wr r0, 0x74
+    ; CRC polynomial 0x00004599
+    ldi8.l r0, 0x99
+    ldi8.h r0, 0x45
+    csr_wr r0, 0x75
+    ldi8.l r0, 0
+    ldi8.h r0, 0
+    csr_wr r0, 0x76
+    ; transfer length two bits, MSB wire order: (2-1) | bit4 = 0x11
+    ldi8.l r0, 0x11
+    ldi8.h r0, 0
+    csr_wr r0, 0x79
+    ; DPLL hard snap, 60-cycle bit cell = 0x3c01
+    ldi8.l r0, 0x01
+    ldi8.h r0, 0x3c
+    csr_wr r0, 0x7c
+    ; soft reset + sticky-status clear + CRC reset, then release and arm RX
+    bcu_ctrl 0x34
+    bcu_ctrl 0x00
+    bcu_ctrl 0x02
+
+    ; r1 = rx_full mask, r2 = capture-base-biased pair count/address,
+    ; r3 = capture-base-biased final target (zero until core2 publishes it).
+    ; Pair P is stored at byte 0x80+P, so r2 is both the event count plus
+    ; the base and the exact store address: no separate pointer register.
+    ldi8.l r1, 0x20
+    ldi8.h r1, 0
+    ldi8.l r2, 0x80
+    ldi8.h r2, 0
+    ldi8.l r3, 0
+    ldi8.h r3, 0
+
+rx_wait_sof:
+    pin_in r0, 3
+    mov r0, r0              ; dominant SOF is 0 -> Z
+    jnz rx_wait_sof
+    ldi8.l r0, 1
+    ldi8.h r0, 0
+    csr_wr r0, 0x02         ; EV_SET bit0: wake the core2 RX assistant
+
+; Three-instruction hot poll.  rx_full is a level until bcu_rx pops it;
+; two logical bits cannot complete again for at least two wire bit times
+; (120 cycles), so the rare event-service path has generous slack.
+rx_poll:
+    bcu_stat r0
+    and r0, r1              ; bit5 rx_full; high target bits in r1 are inert
+    jz rx_poll
+
+    inc r2                  ; biased pair count and this pair's byte address
+    cmp r2, r3              ; core2 publishes the biased final target here
+    jz rx_final_event
+
+    ; Base 0x80 + 50 pairs exceeds the largest legal CAN 2.0A target
+    ; (base + 49).  If seen, destuff synchronization or frame structure
+    ; was irrecoverably broken.
+    ldi8.l r0, 0x80 + 50
+    ldi8.h r0, 0
+    cmp r2, r0
+    jz rx_error_overrun
+
+    ; Pop and preserve the non-final pair.  Only its low two bits are the
+    ; newest logical pair; upper bits are older shift history and masked off
+    ; by the postprocess readers.  Then refresh the assistant-published
+    ; target.  This uniform service loop is deliberately tiny enough to
+    ; remain cache-resident; there are no per-count parse detours.
+    bcu_rx r0
+    st_dmem_b r0, [r2]
+    ldi8.l r0, 0xf3
+    ldi8.h r0, 0
+    ld_dmem_b r3, [r0]
+    jmp rx_poll
+
+; The target pair event is the center sample of the final CRC bit.  Freeze
+; the receiver immediately, inspect crc_ok/stuff_err, and emit a tightly
+; bounded in-slot ACK pulse only for a clean CRC.  The ACK pulse is placed
+; in the middle of the ACK bit rather than at its boundary, making it
+; immune to the few cycles of poll/input synchronization uncertainty while
+; remaining entirely inside the slot.
+rx_final_event:
+    bcu_ctrl 0x00           ; disarm RX: freeze CRC residue and pair shadow
+    set_anchor 0            ; detection-time reference
+    bcu_stat r0
+    ldi8.l r2, 0xf7
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]      ; debug/status snapshot
+
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    and r2, r0              ; crc_ok bit0
+    jz rx_no_ack
+    ldi8.l r2, 8
+    ldi8.h r2, 0
+    and r2, r0              ; stuff_err bit3
+    jnz rx_no_ack
+
+    ; Valid CRC and no stuffing violation: dominant for 40 cycles centered
+    ; in the ACK slot.  Deadlines are cumulative from the detection anchor,
+    ; so the status snapshot instructions above are absorbed in the delay.
+    wait_phase 88
+    pin_oe 0x1, 0x1
+    wait_phase 128
+    pin_oe 0x1, 0x0
+    ldi8.l r0, 1
+    ldi8.h r0, 0
+    ldi8.l r2, 0xf6
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]      ; ACK decision marker
+    jmp rx_final_captured
+
+rx_no_ack:
+    ldi8.l r0, 0
+    ldi8.h r0, 0
+    ldi8.l r2, 0xf6
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+
+rx_final_captured:
+    ; The final pair remains in the shadow because no further two-bit group
+    ; can overwrite it while RX is disarmed.
+    bcu_rx r0
+    st_dmem_b r0, [r3]
+
+; ----------------------------------------------------------------------
+; Relaxed postprocess: parse identifier/DLC/payload from the pair bytes.
+; ----------------------------------------------------------------------
+    ; DLC -> mailbox 0x32 and extraction count scratch 0xf1
+    call rx_read_dlc
+    ldi8.l r0, 0x32
+    ldi8.h r0, 0
+    st_dmem_b r1, [r0]
+    ldi8.l r0, 0xf1
+    ldi8.h r0, 0
+    st_dmem_b r1, [r0]
+
+    ; identifier -> mailbox 0x30 (low), 0x31 (high)
+    call rx_read_id
+    ldi8.l r0, 0x30
+    ldi8.h r0, 0
+    st_dmem_b r1, [r0]
+    mov r2, r1
+    shr r2
+    shr r2
+    shr r2
+    shr r2
+    shr r2
+    shr r2
+    shr r2
+    shr r2
+    ldi8.l r0, 0x31
+    ldi8.h r0, 0
+    st_dmem_b r2, [r0]
+
+    ; Valid ACK decision is a prerequisite for accepting the frame.
+    ldi8.l r0, 0xf6
+    ldi8.h r0, 0
+    ld_dmem_b r2, [r0]
+    mov r2, r2
+    jz rx_bad_frame
+
+    ; SOF must be dominant.  It is pair1 bit1 (byte 0x81 bit1).
+    ldi8.l r0, 0x81
+    ldi8.h r0, 0
+    ld_dmem_b r1, [r0]
+    ldi8.l r2, 2
+    ldi8.h r2, 0
+    and r1, r2
+    jnz rx_bad_frame
+
+    ; IDE (logical bit 14) is pair7 bit0 (byte 0x87 bit0) and must be dominant.
+    ldi8.l r0, 0x87
+    ldi8.h r0, 0
+    ld_dmem_b r1, [r0]
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    and r1, r2
+    jnz rx_bad_frame
+
+    ; Reject reserved DLC values 9..15 (8 itself is legal).
+    ldi8.l r0, 0x32
+    ldi8.h r0, 0
+    ld_dmem_b r1, [r0]
+    mov r2, r1
+    ldi8.l r3, 8
+    ldi8.h r3, 0
+    and r2, r3
+    jz rx_dlc_legal
+    mov r2, r1
+    ldi8.l r3, 7
+    ldi8.h r3, 0
+    and r2, r3
+    jz rx_dlc_legal
+    jmp rx_bad_frame
+rx_dlc_legal:
+
+    ; Payload extraction.  r3 is the moving start-pair pointer (10,14,...)
+    ; advanced by rx_extract_byte.  Count and output pointer live in memory
+    ; because all four architectural registers are needed by the extractor.
+    ldi8.l r0, 0x40
+    ldi8.h r0, 0
+    ldi8.l r2, 0xf2
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]      ; output pointer scratch
+    ldi8.l r3, 0x8a
+    ldi8.h r3, 0
+
+rx_payload_loop:
+    ldi8.l r0, 0xf1
+    ldi8.h r0, 0
+    ld_dmem_b r2, [r0]
+    mov r2, r2
+    jz rx_frame_valid_done
+    call rx_extract_byte    ; r1 = payload byte, r3 += 4
+
+    ; Store at the output pointer and increment it in memory.
+    ldi8.l r0, 0xf2
+    ldi8.h r0, 0
+    ld_dmem_b r2, [r0]
+    st_dmem_b r1, [r2]
+    inc r2
+    st_dmem_b r2, [r0]
+
+    ; Decrement the byte count in memory.
+    ldi8.l r0, 0xf1
+    ldi8.h r0, 0
+    ld_dmem_b r2, [r0]
+    dec r2
+    st_dmem_b r2, [r0]
+    jmp rx_payload_loop
+
+rx_frame_valid_done:
+    ldi8.l r0, 1
+    ldi8.h r0, 0
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]      ; valid frame received and ACKed
+    pin_oe 0x1, 0x0
     halt
+
+rx_bad_frame:
+    ; Classify the hardware capture failure.  A missing crc_ok is a CRC
+    ; mismatch unless the sticky stuff-error bit explains the capture.
+    ldi8.l r0, 0xf7
+    ldi8.h r0, 0
+    ld_dmem_b r1, [r0]
+    ldi8.l r2, 8
+    ldi8.h r2, 0
+    and r2, r1
+    jnz rx_bad_stuff
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    and r2, r1
+    jz rx_bad_crc
+    ldi8.l r0, 0x30         ; CRC-valid but illegal 2.0A structure
+    jmp rx_bad_store
+rx_bad_stuff:
+    ldi8.l r0, 0x10
+    jmp rx_bad_store
+rx_bad_crc:
+    ldi8.l r0, 0x20
+rx_bad_store:
+    ldi8.h r0, 0
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    pin_oe 0x1, 0x0
+    halt
+
+rx_error_overrun:
+    bcu_ctrl 0x00
+    pin_oe 0x1, 0x0
+    ldi8.l r0, 0x10
+    ldi8.h r0, 0
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    st_dmem_b r0, [r2]
+    halt
+
+; rx_read_dlc: return r1 = DLC parsed from pair bytes 7/8/9.
+; Clobbers r0,r2,r3.
+rx_read_dlc:
+    ; pair8 bit0 is DLC bit3 (weight 8)
+    ldi8.l r0, 0x88
+    ldi8.h r0, 0
+    ld_dmem_b r1, [r0]
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    and r1, r2
+    shl r1
+    shl r1
+    shl r1
+    ; pair9 bit1 is DLC bit2 (weight 4)
+    ldi8.l r0, 0x89
+    ldi8.h r0, 0
+    ld_dmem_b r3, [r0]
+    mov r0, r3
+    ldi8.l r2, 2
+    and r0, r2
+    shl r0
+    or r1, r0
+    ; pair9 bit0 is DLC bit1 (weight 2)
+    mov r0, r3
+    ldi8.l r2, 1
+    and r0, r2
+    shl r0
+    or r1, r0
+    ; pair10 bit1 is DLC bit0 (weight 1)
+    ldi8.l r0, 0x8a
+    ldi8.h r0, 0
+    ld_dmem_b r3, [r0]
+    mov r0, r3
+    ldi8.l r2, 2
+    and r0, r2
+    shr r0
+    or r1, r0
+    ret
+
+; rx_read_id: return r1 = 11-bit identifier.  Pair layout makes this a
+; compact two-bit-at-a-time accumulation:
+;   p1[0]=id10, p2[1:0]=id9..8, ..., p6[1:0]=id1..0.
+; Clobbers r0,r2,r3.
+rx_read_id:
+    ldi8.l r2, 3
+    ldi8.h r2, 0            ; two-bit mask
+    ldi8.l r0, 0x81
+    ldi8.h r0, 0
+    ld_dmem_b r1, [r0]
+    and r1, r2              ; SOF bit is zero, so p1&3 == id10
+
+    ldi8.l r0, 0x82
+    ldi8.h r0, 0
+    ld_dmem_b r3, [r0]
+    and r3, r2
+    shl r1
+    shl r1
+    or r1, r3
+
+    ldi8.l r0, 0x83
+    ldi8.h r0, 0
+    ld_dmem_b r3, [r0]
+    and r3, r2
+    shl r1
+    shl r1
+    or r1, r3
+
+    ldi8.l r0, 0x84
+    ldi8.h r0, 0
+    ld_dmem_b r3, [r0]
+    and r3, r2
+    shl r1
+    shl r1
+    or r1, r3
+
+    ldi8.l r0, 0x85
+    ldi8.h r0, 0
+    ld_dmem_b r3, [r0]
+    and r3, r2
+    shl r1
+    shl r1
+    or r1, r3
+
+    ldi8.l r0, 0x86
+    ldi8.h r0, 0
+    ld_dmem_b r3, [r0]
+    and r3, r2
+    shl r1
+    shl r1
+    or r1, r3
+    ret
+
+; rx_extract_byte: input r3 = address of the pair containing a payload
+; byte's first bit in bit0.  Returns r1 = byte and advances r3 by four.
+; Payload bits have constant modulo-four pair phase: start.b0, then three
+; whole pairs, then next-start.b1.  Clobbers r0,r2.
+rx_extract_byte:
+    ld_dmem_b r1, [r3]
+    ldi8.l r2, 1
+    ldi8.h r2, 0
+    and r1, r2              ; payload bit7
+
+    shl r1
+    shl r1
+    ld_dmem_b r0, [r3+1]
+    ldi8.l r2, 3
+    and r0, r2
+    or r1, r0
+
+    shl r1
+    shl r1
+    ld_dmem_b r0, [r3+2]
+    and r0, r2
+    or r1, r0
+
+    shl r1
+    shl r1
+    ld_dmem_b r0, [r3+3]
+    and r0, r2
+    or r1, r0
+
+    inc r3
+    inc r3
+    inc r3
+    inc r3                  ; now the next byte's start pair
+    shl r1
+    ld_dmem_b r0, [r3]
+    ldi8.l r2, 2
+    and r0, r2
+    shr r0                  ; payload bit0
+    or r1, r0
+    ret

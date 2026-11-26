@@ -122,3 +122,15 @@ def test_can_codec_enforces_stuffing_rule():
 # ----------------------------------------------------------------------
 def test_can20a_tx_frame():
     _run("test_can20a_tx_frame")
+
+
+def test_can20a_rx_frame():
+    _run("test_can20a_rx_frame")
+
+
+def test_can20a_rx_rejects_bad_crc():
+    _run("test_can20a_rx_rejects_bad_crc")
+
+
+def test_can20a_rx_detects_stuff_error():
+    _run("test_can20a_rx_detects_stuff_error")
